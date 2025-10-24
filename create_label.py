@@ -1,6 +1,5 @@
 import os
 import csv
-import numpy as np
 
 base_dir = "datasets"
 input_dir = os.path.join(base_dir, "input_data")
