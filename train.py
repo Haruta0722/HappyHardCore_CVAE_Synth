@@ -136,7 +136,7 @@ class WaveDecoder(layers.Layer):
         latent_dim=LATENT_DIM,
         upsample_factors=(2, 2, 2),
         channel=128,
-        **kwargs
+        **kwargs,
     ):
         super().__init__(**kwargs)
         self.cond_dim = cond_dim
@@ -365,3 +365,6 @@ def train(csv_path):
 
 if __name__ == "__main__":
     model = train("datasets/labels.csv")
+    save_path = "checkpoints/wavecvae_weights.h5"
+    model.save_weights(save_path)
+    print(f"✅ モデル重みを保存しました: {save_path}")
