@@ -3,6 +3,7 @@ import tensorflow as tf
 from tensorflow.keras import layers, Model
 import pandas as pd
 import numpy as np
+import librosa
 
 # ---------------------
 # ハイパーパラメータ
@@ -22,13 +23,13 @@ LR = 1e-4
 # ---------------------
 # データ読み込み -> waveform（任意長）関数
 # ---------------------
-def load_wav(path):
-    """path: scalar tf.string"""
-    audio_binary = tf.io.read_file(path)
-    decoded = tf.audio.decode_wav(audio_binary)  # returns AudioDecodeWav object
-    audio_data = getattr(decoded, "audio")
-    audio = tf.squeeze(audio_data, axis=-1)  # shape [samples]
-    return audio
+def load_wav(path: tf.Tensor | str) -> tf.Tensor:
+    if isinstance(path, tf.Tensor):
+        path_str = path.numpy().decode("utf-8")
+    else:
+        path_str = str(path)
+    audio, sr = librosa.load(path_str, sr=32000, mono=True)
+    return tf.convert_to_tensor(audio, dtype=tf.float32)
 
 
 def make_mask_from_length(lengths, max_len):
@@ -143,17 +144,19 @@ class WaveDecoder(layers.Layer):
         self.channel = channel
         # small dense stack to expand
         self.d1 = layers.Dense(1024, activation="relu")
-        self.d2 = layers.Dense((256), activation="relu")  # intermediate
+        self.d2 = layers.Dense(self.channel, activation="relu")  # intermediate
         # will expand into time-steps via tile
         self.lstm = layers.Conv1D(
-            256, 3, padding="same", activation="relu"
+            self.channel, 3, padding="same", activation="relu"
         )  # applied after upsampling
         self.ups = [
             layers.UpSampling1D(size=2),
             layers.UpSampling1D(size=2),
             layers.UpSampling1D(size=2),
         ]
-        self.conv_up = layers.Conv1D(128, 9, padding="same", activation="relu")
+        self.conv_up = layers.Conv1D(
+            self.channel, 9, padding="same", activation="relu"
+        )
         self.out_conv = layers.Conv1D(
             1, 7, padding="same", activation=None
         )  # raw waveform (no activation)
