@@ -58,5 +58,3 @@ def build_dataset_from_csv(csv_path):
         4, padded_shapes=(((None, None), (4,)), (None, None))
     )
     return dataset.prefetch(tf.data.AUTOTUNE)
-    
-
