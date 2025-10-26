@@ -1,20 +1,22 @@
 # cvae_waveform_stft.py
+import json
 import tensorflow as tf
 from tensorflow.keras import layers, Model
 import pandas as pd
 import numpy as np
 import librosa
+import os
 
 # ---------------------
 # ハイパーパラメータ
 # ---------------------
 SR = 32000
-FRAME_LENGTH = 1024
+FRAME_LENGTH = 512
 FRAME_STEP = 256
 
 LATENT_DIM = 64
 COND_DIM = 4
-BATCH_SIZE = 4
+BATCH_SIZE = 1
 EPOCHS = 50
 KL_WEIGHT = 1e-3
 LR = 1e-4
@@ -315,14 +317,53 @@ def _post_batch_map(x_batch, y_batch, cond_batch):
 
 
 # ---------------------
+CHECKPOINT_DIR = "checkpoints"
+CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "wavecvae.weights.h5")
+PROGRESS_PATH = os.path.join(CHECKPOINT_DIR, "progress.json")
+
+
+# ---------------------
 # Training loop
 # ---------------------
 def train(csv_path):
+    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
     ds = build_wave_dataset_from_csv(csv_path, batch_size=BATCH_SIZE)
     model = WaveCVAE(
         latent_dim=LATENT_DIM, cond_dim=COND_DIM, kl_weight=KL_WEIGHT
     )
     opt = tf.keras.optimizers.Adam(LR)
+
+    # ===== モデル初期化 =====
+    for batch in ds.take(1):
+        (x_batch, cond_batch, mask_frames), y_batch = batch
+        input_shape = (
+            (None,) + tuple(x_batch.shape[1:]),
+            (None,) + tuple(cond_batch.shape[1:]),
+            (None,) + tuple(mask_frames.shape[1:]),
+        )
+        model.build(input_shape)
+        _ = model.compute_losses(x_batch, cond_batch, mask_frames, y_batch)
+        break
+    print("✅ モデルを初期化しました。")
+    for batch in ds.take(1):
+        (x_batch, cond_batch, mask_frames), y_batch = batch
+        _ = model.compute_losses(x_batch, cond_batch, mask_frames, y_batch)
+        break
+    print("✅ モデル構造をビルドしました。")
+
+    # --- 前回の進捗を読み込み ---
+    start_epoch, start_step = 0, 0
+    if os.path.exists(PROGRESS_PATH) and os.path.exists(CHECKPOINT_PATH):
+        with open(PROGRESS_PATH, "r") as f:
+            progress = json.load(f)
+        start_epoch = progress.get("epoch", 0)
+        start_step = progress.get("step", 0)
+        print(
+            f"🔁 前回のチェックポイントから再開します: epoch={start_epoch}, step={start_step}"
+        )
+        model.load_weights(CHECKPOINT_PATH)
+    else:
+        print("🚀 新規学習を開始します")
 
     @tf.function
     def step(batch):
@@ -338,8 +379,13 @@ def train(csv_path):
         model.kl_tracker.update_state(kl)
         return total, recon, kl
 
-    for epoch in range(EPOCHS):
+    # --- 学習ループ ---
+    for epoch in range(start_epoch, EPOCHS):
         for step_i, batch in enumerate(ds):
+            # 再開地点をスキップ
+            if epoch == start_epoch and step_i < start_step:
+                continue
+
             total, recon, kl = step(batch)
             if step_i % 10 == 0:
                 tf.print(
@@ -354,17 +400,25 @@ def train(csv_path):
                     "kl",
                     kl,
                 )
+                # --- チェックポイント保存 ---
+                model.save_weights(CHECKPOINT_PATH)
+                with open(PROGRESS_PATH, "w") as f:
+                    json.dump({"epoch": epoch, "step": step_i}, f)
+                print(f"💾 チェックポイントを保存しました: {CHECKPOINT_PATH}")
+
         tf.print("Epoch", epoch + 1, "avg loss", model.loss_tracker.result())
         # reset metrics
-        model.loss_tracker.reset_states()
-        model.recon_tracker.reset_states()
-        model.kl_tracker.reset_states()
+        model.loss_tracker.reset_state()
+        model.recon_tracker.reset_state()
+        model.kl_tracker.reset_state()
+        # epoch終了時にも進捗保存
+        with open(PROGRESS_PATH, "w") as f:
+            json.dump({"epoch": epoch + 1, "step": 0}, f)
+        model.save_weights(CHECKPOINT_PATH)
+        print(f"✅ エポック {epoch + 1} の重みを保存しました")
 
     return model
 
 
 if __name__ == "__main__":
     model = train("datasets/labels.csv")
-    save_path = "checkpoints/wavecvae_weights.h5"
-    model.save_weights(save_path)
-    print(f"✅ モデル重みを保存しました: {save_path}")
