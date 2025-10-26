@@ -1,2 +1,5 @@
 *.wav
 *.csv
+/.venv
+/checkpoints
+/__pycache__/
