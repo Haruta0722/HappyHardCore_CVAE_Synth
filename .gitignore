@@ -3,3 +3,5 @@
 /.venv
 /checkpoints
 /__pycache__/
+/hhc/*
+!hhc/app/

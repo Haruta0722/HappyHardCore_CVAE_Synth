@@ -16,9 +16,9 @@ FRAME_STEP = 256
 
 LATENT_DIM = 64
 COND_DIM = 4
-BATCH_SIZE = 1
-EPOCHS = 50
-KL_WEIGHT = 1e-3
+BATCH_SIZE = 16
+EPOCHS = 40
+KL_WEIGHT = 1e-1
 LR = 1e-4
 
 
@@ -115,9 +115,7 @@ def build_wave_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     h = layers.Conv1D(128, 9, strides=2, padding="same", activation="relu")(
         h
     )  # /4
-    h = layers.Conv1D(256, 9, strides=2, padding="same", activation="relu")(
-        h
-    )  # /8
+
     h = layers.GlobalAveragePooling1D()(h)  # [B, channels]
     mu = layers.Dense(latent_dim, name="mu")(h)
     logvar = layers.Dense(latent_dim, name="logvar")(h)
@@ -147,6 +145,9 @@ class WaveDecoder(layers.Layer):
         # small dense stack to expand
         self.d1 = layers.Dense(1024, activation="relu")
         self.d2 = layers.Dense(self.channel, activation="relu")  # intermediate
+        self.dropout1 = layers.Dropout(0.1)
+        self.dropout2 = layers.Dropout(0.05)
+        self.gauss_noise = layers.GaussianNoise(0.01)
         # will expand into time-steps via tile
         self.lstm = layers.Conv1D(
             self.channel, 3, padding="same", activation="relu"
@@ -154,13 +155,12 @@ class WaveDecoder(layers.Layer):
         self.ups = [
             layers.UpSampling1D(size=2),
             layers.UpSampling1D(size=2),
-            layers.UpSampling1D(size=2),
         ]
         self.conv_up = layers.Conv1D(
             self.channel, 9, padding="same", activation="relu"
         )
         self.out_conv = layers.Conv1D(
-            1, 7, padding="same", activation=None
+            1, 7, padding="same", activation="tanh"
         )  # raw waveform (no activation)
 
     def call(self, z, cond, target_time, training=False):
@@ -168,14 +168,18 @@ class WaveDecoder(layers.Layer):
         h = tf.concat([z, cond], axis=-1)
         h = self.d1(h)  # [B,1024]
         h = self.d2(h)  # [B,256]
+        h = self.dropout1(h, training=training)
+
         # create a short seed sequence then upsample to target_time
         seed_len = tf.maximum(1, target_time // (2 ** len(self.ups)))
         h = tf.expand_dims(h, axis=1)  # [B,1,C]
         h = tf.tile(h, [1, seed_len, 1])  # [B, seed_len, C]
+        h = self.gauss_noise(h, training=training)
         # progressively upsample until reaching >= target_time
         for up in self.ups:
             h = up(h)
             h = self.conv_up(h)
+            h = self.dropout2(h, training=training)
         # now h length should be >= target_time; trim or pad
         cur_len = tf.shape(h)[1]
 
@@ -193,18 +197,28 @@ class WaveDecoder(layers.Layer):
         out = self.out_conv(h)  # [B, target_time, 1]
         return out
 
+    def build(self, input_shape):
+        # input_shapeは [ (batch, latent_dim), (batch, cond_dim), target_time ] に対応
+        # 特別な重みを追加しない場合でも build() 呼び出しを明示的にしておく
+        super().build(input_shape)
+
 
 # ---------------------
 # Full model wrapper with loss computation
 # ---------------------
 class WaveCVAE(Model):
     def __init__(
-        self, latent_dim=LATENT_DIM, cond_dim=COND_DIM, kl_weight=KL_WEIGHT
+        self,
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        kl_weight=KL_WEIGHT,
+        **kwargs,
     ):
-        super().__init__()
+        super().__init__(**kwargs)
         self.encoder = build_wave_encoder(
             cond_dim=cond_dim, latent_dim=latent_dim
         )
+        self.cond_dim = cond_dim
         self.reparam = Reparam()
         self.decoder = WaveDecoder(cond_dim=cond_dim, latent_dim=latent_dim)
         self.kl_weight = kl_weight
@@ -242,6 +256,21 @@ class WaveCVAE(Model):
         kl = tf.reduce_mean(tf.reduce_sum(kl_per, axis=1))
         total = recon + self.kl_weight * kl
         return total, recon, kl, y_pred_wav
+
+    def get_config(self):
+        config = super().get_config()
+        config.update(
+            {
+                "latent_dim": self.encoder.get_layer("mu").units,
+                "cond_dim": self.cond_dim,
+                "kl_weight": self.kl_weight,
+            }
+        )
+        return config
+
+    @classmethod
+    def from_config(cls, config):
+        return cls(**config)
 
 
 # ---------------------
@@ -319,6 +348,7 @@ def _post_batch_map(x_batch, y_batch, cond_batch):
 # ---------------------
 CHECKPOINT_DIR = "checkpoints"
 CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "wavecvae.weights.h5")
+MODEL_PATH = os.path.join(CHECKPOINT_DIR, "wavecvae.model.keras")
 PROGRESS_PATH = os.path.join(CHECKPOINT_DIR, "progress.json")
 
 
@@ -379,6 +409,15 @@ def train(csv_path):
         model.kl_tracker.update_state(kl)
         return total, recon, kl
 
+    # 線形アニーリングの設定
+    anneal_frac = 0.5  # 線形増加するステップの割合
+    total_steps = EPOCHS * tf.data.experimental.cardinality(ds).numpy()
+    anneal_steps = int(total_steps * anneal_frac)
+
+    def linear_anneal(step, anneal_steps, kl_start=1e-3, kl_end=1.0):
+        fraction = min(1.0, step / anneal_steps)
+        return kl_start + fraction * (kl_end - kl_start)
+
     # --- 学習ループ ---
     for epoch in range(start_epoch, EPOCHS):
         for step_i, batch in enumerate(ds):
@@ -386,6 +425,7 @@ def train(csv_path):
             if epoch == start_epoch and step_i < start_step:
                 continue
 
+            model.kl_weight = linear_anneal(step_i, anneal_steps)
             total, recon, kl = step(batch)
             if step_i % 10 == 0:
                 tf.print(
@@ -415,6 +455,7 @@ def train(csv_path):
         with open(PROGRESS_PATH, "w") as f:
             json.dump({"epoch": epoch + 1, "step": 0}, f)
         model.save_weights(CHECKPOINT_PATH)
+        model.save(MODEL_PATH)
         print(f"✅ エポック {epoch + 1} の重みを保存しました")
 
     return model
