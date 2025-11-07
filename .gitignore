@@ -5,3 +5,5 @@
 /__pycache__/
 /hhc/*
 !hhc/app/
+*.DS_Store
+*.code-workspace

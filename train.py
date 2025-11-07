@@ -396,57 +396,72 @@ def train(csv_path):
         print("🚀 新規学習を開始します")
 
     @tf.function
-    def step(batch):
+    def step(model, opt, batch, global_step, anneal_steps, free_nats=0.3):
         (x_batch, cond_batch, mask_frames), y_batch = batch
+        kl_weight = linear_anneal(global_step, anneal_steps)
+
         with tf.GradientTape() as tape:
             total, recon, kl, y_pred = model.compute_losses(
                 x_batch, cond_batch, mask_frames, y_batch
             )
-        grads = tape.gradient(total, model.trainable_variables)
+            kl_adj = tf.maximum(kl, free_nats)
+            loss_for_backprop = recon + kl_weight * kl_adj
+
+        grads = tape.gradient(loss_for_backprop, model.trainable_variables)
         opt.apply_gradients(zip(grads, model.trainable_variables))
-        model.loss_tracker.update_state(total)
+
+        model.loss_tracker.update_state(loss_for_backprop)
         model.recon_tracker.update_state(recon)
         model.kl_tracker.update_state(kl)
-        return total, recon, kl
 
-    # 線形アニーリングの設定
-    anneal_frac = 0.5  # 線形増加するステップの割合
+        return total, recon, kl, kl_adj, kl_weight
+
+        # --- 学習ループ ---
+    global_step = start_epoch * tf.data.experimental.cardinality(ds).numpy() + start_step
+    anneal_frac = 0.5
     total_steps = EPOCHS * tf.data.experimental.cardinality(ds).numpy()
     anneal_steps = int(total_steps * anneal_frac)
 
-    def linear_anneal(step, anneal_steps, kl_start=1e-3, kl_end=1.0):
-        fraction = min(1.0, step / anneal_steps)
+    def linear_anneal(global_step, anneal_steps, kl_start=1e-3, kl_end=1.0):
+    # Tensor に変換して float32 に揃える
+        global_step = tf.cast(global_step, tf.float32)
+        anneal_steps = tf.cast(anneal_steps, tf.float32)
+        
+        fraction = tf.minimum(
+            tf.constant(1.0, dtype=tf.float32),
+            global_step / tf.maximum(tf.constant(1.0, dtype=tf.float32), anneal_steps)
+        )
+        
         return kl_start + fraction * (kl_end - kl_start)
 
-    # --- 学習ループ ---
+    FREE_NATS = 0.2  # ← まずは 0.1〜0.5 の間で試す
+
     for epoch in range(start_epoch, EPOCHS):
         for step_i, batch in enumerate(ds):
-            # 再開地点をスキップ
             if epoch == start_epoch and step_i < start_step:
+                global_step += 1
                 continue
 
-            model.kl_weight = linear_anneal(step_i, anneal_steps)
-            total, recon, kl = step(batch)
+            total, recon, kl, kl_adj, kl_weight = step(
+                model, opt, batch, global_step, anneal_steps, FREE_NATS
+            )
+
             if step_i % 10 == 0:
                 tf.print(
-                    "Epoch",
-                    epoch + 1,
-                    "Step",
-                    step_i,
-                    "loss",
-                    total,
-                    "recon",
-                    recon,
-                    "kl",
-                    kl,
+                    "Epoch", epoch + 1, "Step", step_i,
+                    "loss", total,
+                    "recon", recon,
+                    "kl", kl, "kl_adj", kl_adj, "kl_w", kl_weight
                 )
-                # --- チェックポイント保存 ---
                 model.save_weights(CHECKPOINT_PATH)
                 with open(PROGRESS_PATH, "w") as f:
                     json.dump({"epoch": epoch, "step": step_i}, f)
                 print(f"💾 チェックポイントを保存しました: {CHECKPOINT_PATH}")
 
+            global_step += 1
         tf.print("Epoch", epoch + 1, "avg loss", model.loss_tracker.result())
+        mu, logvar = model.encoder([x_batch[..., None], cond_batch], training=False)
+        print("mean std:", tf.math.reduce_std(mu).numpy(), "logvar mean:", tf.reduce_mean(logvar).numpy())
         # reset metrics
         model.loss_tracker.reset_state()
         model.recon_tracker.reset_state()
