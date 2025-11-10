@@ -1,480 +1,451 @@
-# cvae_waveform_stft.py
-import json
-import tensorflow as tf
-from tensorflow.keras import layers, Model
-import pandas as pd
-import numpy as np
-import librosa
+# file: cvae_time_conditional_improved.py
+# TensorFlow 2.x 用（例: 2.10+）
+# datasets/labels.csv を読み、input_path, output_path, attack, distortion, thickness, center_tone を使って学習
+
 import os
-
-# ---------------------
-# ハイパーパラメータ
-# ---------------------
+import glob
+import math
+import numpy as np
+import pandas as pd
+import tensorflow as tf
+import librosa
+import soundfile as sf
+import tensorflow.keras.layers as layers
+# -------------------------
+# ハイパーパラメータ（調整可）
+# -------------------------
 SR = 32000
-FRAME_LENGTH = 512
-FRAME_STEP = 256
+BATCH_SIZE = 4            # 長い波形なら小さめに
+LATENT_DIM = 64           # 時間方向の潜在次元（per time-step）
+ENC_CHANNELS = [64, 128, 256]
+DOWNSAMPLE_FACTORS = [4, 4, 4]   # 合計縮小率 = 64
+DEC_CHANNELS = ENC_CHANNELS[::-1]
+LEARNING_RATE = 1e-4
+EPOCHS = 200
+WAVE_L1_WEIGHT = 1.0
+STFT_WEIGHT = 1.0
+MEL_WEIGHT = 1.0
+KL_WEIGHT_MAX = 1.0
+ANNEAL_STEPS = 100000    # とてもゆっくり増やす（posterior collapse防止）
+FREE_BITS = 0.5          # free bits（nats） per latent-dimension (大きさは調整)
+STFT_FFTS = [512, 1024, 2048]
+MEL_BINS = 80
 
-LATENT_DIM = 64
-COND_DIM = 4
-BATCH_SIZE = 16
-EPOCHS = 40
-KL_WEIGHT = 1e-1
-LR = 1e-4
+# データ CSV パス
+LABEL_CSV = "datasets/labels.csv"
+BASE_DIR = "."  # CSV内の相対パス基準（必要なら変更）
 
+# -------------------------
+# ユーティリティ
+# -------------------------
+def load_wav(path, sr=SR):
+    y, _ = librosa.load(path, sr=sr, mono=True)
+    # RMS normalize to preserve relative amplitude (avoid centering to zero mean causing trivial zero solution)
+    rms = np.sqrt(np.mean(y**2) + 1e-9)
+    target_rms = 0.1  # 小さめに揃える（調整可）
+    y = y / rms * target_rms
+    return y.astype(np.float32)
 
-# ---------------------
-# データ読み込み -> waveform（任意長）関数
-# ---------------------
-def load_wav(path: tf.Tensor | str) -> tf.Tensor:
-    if isinstance(path, tf.Tensor):
-        path_str = path.numpy().decode("utf-8")
-    else:
-        path_str = str(path)
-    audio, sr = librosa.load(path_str, sr=32000, mono=True)
-    return tf.convert_to_tensor(audio, dtype=tf.float32)
+def write_wav(path, y, sr=SR):
+    y = np.clip(y, -1.0, 1.0)
+    sf.write(path, y, sr)
 
-
-def make_mask_from_length(lengths, max_len):
-    """lengths: [B] int32 tensor (samples), max_len: int -> produce boolean mask per sample in frames"""
-    # convert sample-lengths to frame counts used by STFT:
-    # number of frames = floor((n_samples - frame_length) / frame_step) + 1 for n_samples >= frame_length
-    # We'll compute frames = tf.maximum(0, (n_samples - FRAME_LENGTH) // FRAME_STEP + 1)
-    frames = tf.maximum(0, (lengths - FRAME_LENGTH) // FRAME_STEP + 1)
-    # But batch will be padded to max_samples; compute max_frames accordingly
-    max_frames = tf.maximum(0, (max_len - FRAME_LENGTH) // FRAME_STEP + 1)
-    # create mask [B, max_frames]
-    rng = tf.range(max_frames)
-    frames = tf.expand_dims(frames, axis=1)  # [B,1]
-    mask = tf.less(
-        rng, frames
-    )  # broadcasting -> [max_frames] < [B,1] -> [B, max_frames]
-    mask = tf.cast(mask, tf.bool)
-    return mask  # [B, T_frames]
-
-
-# ---------------------
-# STFT loss (masked)
-# ---------------------
-def stft_magnitude(x):
-    # x: [B, N] waveform (padded)
-    stfts = tf.signal.stft(
-        x,
-        frame_length=FRAME_LENGTH,
-        frame_step=FRAME_STEP,
-        fft_length=FRAME_LENGTH,
-        window_fn=tf.signal.hann_window,
+# -------------------------
+# Melフィルタ行列（TFで計算）
+# -------------------------
+def get_mel_matrix(n_fft, n_mels=MEL_BINS, sr=SR, fmin=0.0, fmax=None):
+    if fmax is None:
+        fmax = sr / 2.0
+    return tf.signal.linear_to_mel_weight_matrix(
+        num_mel_bins=n_mels,
+        num_spectrogram_bins=n_fft // 2 + 1,
+        sample_rate=sr,
+        lower_edge_hertz=fmin,
+        upper_edge_hertz=fmax
     )
-    mag = tf.abs(stfts)  # [B, T_frames, F_bins]
-    return mag
 
+# -------------------------
+# データセット作成
+# CSV は input_path, output_path, attack, distortion, thickness, center_tone を持つ
+# yields: (input_padded, target_padded), lengths, cond_vector
+# -------------------------
+def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, shuffle=True):
+    df = pd.read_csv(csv_path)
+    # 絶対パス化
+    df['input_path'] = df['input_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
+    df['output_path'] = df['output_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
 
-def stft_loss_masked(y_true_wav, y_pred_wav, mask_frames):
-    """
-    y_true_wav, y_pred_wav: [B, N_samples] (padded)
-    mask_frames: [B, T_frames] boolean -> True for valid frames
-    """
-    mag_true = stft_magnitude(y_true_wav)
-    mag_pred = stft_magnitude(y_pred_wav)
-    # log scaling helps stability
-    log_true = tf.math.log(mag_true + 1e-7)
-    log_pred = tf.math.log(mag_pred + 1e-7)
-    # expand mask to freq axis
-    mask_f = tf.cast(
-        tf.expand_dims(mask_frames, axis=-1), tf.float32
-    )  # [B, T, 1]
-    diff = tf.abs(log_true - log_pred) * mask_f
-    # average only over valid frames and freq bins
-    denom = tf.reduce_sum(mask_f) * tf.cast(tf.shape(log_true)[-1], tf.float32)
-    loss = tf.reduce_sum(diff) / (denom + 1e-8)
-    return loss
+    # 読み込み generator
+    def gen():
+        for _, row in df.iterrows():
+            x = load_wav(row['input_path'])
+            y = load_wav(row['output_path'])
+            cond = np.array([row['attack'], row['distortion'], row['thickness'], row['center_tone']], dtype=np.float32)
+            yield x, y, cond, np.int32(len(x)), np.int32(len(y))
 
+    output_signature = (
+        tf.TensorSpec(shape=(None,), dtype=tf.float32),
+        tf.TensorSpec(shape=(None,), dtype=tf.float32),
+        tf.TensorSpec(shape=(4,), dtype=tf.float32),
+        tf.TensorSpec(shape=(), dtype=tf.int32),
+        tf.TensorSpec(shape=(), dtype=tf.int32),
+    )
+    ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
+    if shuffle:
+        ds = ds.shuffle(buffer_size=256)
+    # expand dims to [T,1]
+    ds = ds.map(lambda x, y, c, lx, ly: (tf.expand_dims(x, -1), tf.expand_dims(y, -1), c, lx, ly))
+    # padded_batch（inputとoutputそれぞれ可変長）
+    ds = ds.padded_batch(batch_size,
+                         padded_shapes=([None,1], [None,1], [4], (), ()),
+                         padding_values=(0.0, 0.0, 0.0, 0, 0))
+    ds = ds.prefetch(tf.data.AUTOTUNE)
+    return ds
 
-# ---------------------
-# CVAE (waveform -> waveform)
-# ---------------------
-def build_wave_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
-    """
-    Encoder works on [B, T, 1] waveform (padded)
-    """
-    x_in = layers.Input(shape=(None, 1), name="wave_in")  # time-dim dynamic
-    c_in = layers.Input(shape=(cond_dim,), name="cond")
-
-    # broadcast cond across time
-    def concat_cond(inputs):
-        x, c = inputs
-        t = tf.shape(x)[1]
-        c_t = tf.expand_dims(c, axis=1)  # [B,1,C]
-        c_b = tf.tile(c_t, [1, t, 1])  # [B, t, C]
-        return tf.concat([x, c_b], axis=-1)
-
-    h = layers.Lambda(concat_cond)([x_in, c_in])  # [B, T, 1+cond_dim]
-    # 1D conv stack with downsampling
-    h = layers.Conv1D(64, 9, strides=2, padding="same", activation="relu")(
-        h
-    )  # /2
-    h = layers.Conv1D(128, 9, strides=2, padding="same", activation="relu")(
-        h
-    )  # /4
-
-    h = layers.GlobalAveragePooling1D()(h)  # [B, channels]
-    mu = layers.Dense(latent_dim, name="mu")(h)
-    logvar = layers.Dense(latent_dim, name="logvar")(h)
-    return Model([x_in, c_in], [mu, logvar], name="wave_encoder")
-
-
-class Reparam(layers.Layer):
-    def call(self, inputs):
-        mu, logvar = inputs
-        eps = tf.random.normal(tf.shape(mu))
-        return mu + tf.exp(0.5 * logvar) * eps
-
-
-class WaveDecoder(layers.Layer):
-    def __init__(
-        self,
-        cond_dim=COND_DIM,
-        latent_dim=LATENT_DIM,
-        upsample_factors=(2, 2, 2),
-        channel=128,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
+# -------------------------
+# Encoder / Decoder の構築（条件を使う）
+# Encoder: input waveform -> downsample convs -> mean/logvar (time-distributed)
+# Decoder: z(t) + cond -> upsample convs -> waveform
+# 条件は FiLM 風に各デコーダブロックへ注入する
+# -------------------------
+class FiLM(layers.Layer):
+    def __init__(self, channels, cond_dim=4, name=None):
+        super().__init__(name=name)
+        self.channels = channels
         self.cond_dim = cond_dim
+        # produce scale and shift
+        self.dense = layers.Dense(channels * 2, name=(name or "film_dense"))
+
+    def call(self, x, cond):
+        # x: [B, T, C], cond: [B, cond_dim]
+        gamma_beta = self.dense(cond)  # [B, 2*C]
+        gamma, beta = tf.split(gamma_beta, 2, axis=-1)
+        # expand to time dimension
+        gamma = tf.expand_dims(gamma, 1)
+        beta = tf.expand_dims(beta, 1)
+        return x * (1.0 + gamma) + beta
+
+def build_encoder(latent_dim=LATENT_DIM, channels=ENC_CHANNELS, down_factors=DOWNSAMPLE_FACTORS):
+    inp = layers.Input(shape=(None,1), name='enc_input')
+    x = inp
+    for i, (ch, f) in enumerate(zip(channels, down_factors)):
+        x = layers.Conv1D(ch, kernel_size=9, strides=1, padding='same', activation='relu', name=f'enc_conv_{i}_a')(x)
+        x = layers.Conv1D(ch, kernel_size=9, strides=f, padding='same', activation='relu', name=f'enc_conv_{i}_b')(x)
+        x = layers.BatchNormalization(name=f'enc_bn_{i}')(x)
+    # project to mean/logvar (time-distributed)
+    mean = layers.Conv1D(latent_dim, kernel_size=3, padding='same', name='enc_mean')(x)
+    logvar = layers.Conv1D(latent_dim, kernel_size=3, padding='same', name='enc_logvar')(x)
+    return tf.keras.Model(inp, [mean, logvar], name='time_encoder')
+
+def build_decoder(latent_dim=LATENT_DIM, channels=DEC_CHANNELS, up_factors=DOWNSAMPLE_FACTORS[::-1], cond_dim=4):
+    z_in = layers.Input(shape=(None, latent_dim), name='z_in')
+    cond = layers.Input(shape=(cond_dim,), name='cond_in')
+    x = layers.Conv1D(channels[0], kernel_size=3, padding='same', activation='relu', name='dec_proj')(z_in)
+    film_layers = []
+    for i, f in enumerate(up_factors):
+        x = layers.UpSampling1D(size=f, name=f'dec_upsample_{i}')(x)
+        ch = channels[min(i, len(channels)-1)]
+        x = layers.Conv1D(ch, kernel_size=9, padding='same', activation='relu', name=f'dec_conv_{i}_a')(x)
+        x = layers.Conv1D(ch, kernel_size=9, padding='same', activation='relu', name=f'dec_conv_{i}_b')(x)
+        x = layers.BatchNormalization(name=f'dec_bn_{i}')(x)
+        # FiLM 注入
+        film = FiLM(ch, cond_dim=cond_dim, name=f'film_{i}')
+        x = film(x, cond)
+        film_layers.append(film)
+    out = layers.Conv1D(1, kernel_size=7, padding='same', activation='tanh', name='dec_out')(x)
+    return tf.keras.Model([z_in, cond], out, name='time_decoder')
+
+# -------------------------
+# Reparameterize（time-distributed）
+# -------------------------
+class ReparamTime(layers.Layer):
+    def call(self, mean, logvar, training=True):
+        if training:
+            eps = tf.random.normal(tf.shape(mean))
+            return mean + tf.exp(0.5 * logvar) * eps
+        else:
+            return mean  # use mean for deterministic inference
+
+# -------------------------
+# Loss utilities: complex STFT L1, log-mag L1, mel L1
+# -------------------------
+def stft_complex_l1(y, y_hat, fft_size, hop_size):
+    # y: [B, T], y_hat: [B, T]
+    S = tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+    S_hat = tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+    return tf.reduce_mean(tf.abs(S - S_hat))
+
+def log_mag_l1(y, y_hat, fft_size, hop_size):
+    S = tf.abs(tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
+    S_hat = tf.abs(tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
+    return tf.reduce_mean(tf.abs(tf.math.log(S + 1e-7) - tf.math.log(S_hat + 1e-7)))
+
+def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS):
+    # compute mel via linear_to_mel_weight_matrix
+    S = tf.abs(tf.signal.stft(y, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
+    S_hat = tf.abs(tf.signal.stft(y_hat, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
+    mel_mat = get_mel_matrix(n_fft, n_mels=n_mels)
+    mel = tf.tensordot(S, mel_mat, axes=[-1, 0])  # [B, frames, mels]
+    mel_hat = tf.tensordot(S_hat, mel_mat, axes=[-1, 0])
+    return tf.reduce_mean(tf.abs(tf.math.log(mel + 1e-7) - tf.math.log(mel_hat + 1e-7)))
+
+# -------------------------
+# CVAE 主クラス（カスタム train_step）
+# -------------------------
+class WaveTimeConditionalCVAE(tf.keras.Model):
+    def __init__(self, encoder, decoder, latent_dim=LATENT_DIM,
+                 kl_anneal_steps=ANNEAL_STEPS, kl_weight_max=KL_WEIGHT_MAX,
+                 free_bits=FREE_BITS,
+                 wave_weight=WAVE_L1_WEIGHT, stft_weight=STFT_WEIGHT, mel_weight=MEL_WEIGHT):
+        super().__init__()
+        self.encoder = encoder
+        self.decoder = decoder
+        self.reparam = ReparamTime()
         self.latent_dim = latent_dim
-        self.channel = channel
-        # small dense stack to expand
-        self.d1 = layers.Dense(1024, activation="relu")
-        self.d2 = layers.Dense(self.channel, activation="relu")  # intermediate
-        self.dropout1 = layers.Dropout(0.1)
-        self.dropout2 = layers.Dropout(0.05)
-        self.gauss_noise = layers.GaussianNoise(0.01)
-        # will expand into time-steps via tile
-        self.lstm = layers.Conv1D(
-            self.channel, 3, padding="same", activation="relu"
-        )  # applied after upsampling
-        self.ups = [
-            layers.UpSampling1D(size=2),
-            layers.UpSampling1D(size=2),
-        ]
-        self.conv_up = layers.Conv1D(
-            self.channel, 9, padding="same", activation="relu"
-        )
-        self.out_conv = layers.Conv1D(
-            1, 7, padding="same", activation="tanh"
-        )  # raw waveform (no activation)
+        self.kl_anneal_steps = kl_anneal_steps
+        self.kl_weight_max = kl_weight_max
+        self.free_bits = free_bits
+        self.wave_weight = wave_weight
+        self.stft_weight = stft_weight
+        self.mel_weight = mel_weight
+        self.total_steps = tf.Variable(0, dtype=tf.int32, trainable=False)
 
-    def call(self, z, cond, target_time, training=False):
-        # z: [B, zdim], cond: [B, cdim], target_time: scalar
-        h = tf.concat([z, cond], axis=-1)
-        h = self.d1(h)  # [B,1024]
-        h = self.d2(h)  # [B,256]
-        h = self.dropout1(h, training=training)
-
-        # create a short seed sequence then upsample to target_time
-        seed_len = tf.maximum(1, target_time // (2 ** len(self.ups)))
-        h = tf.expand_dims(h, axis=1)  # [B,1,C]
-        h = tf.tile(h, [1, seed_len, 1])  # [B, seed_len, C]
-        h = self.gauss_noise(h, training=training)
-        # progressively upsample until reaching >= target_time
-        for up in self.ups:
-            h = up(h)
-            h = self.conv_up(h)
-            h = self.dropout2(h, training=training)
-        # now h length should be >= target_time; trim or pad
-        cur_len = tf.shape(h)[1]
-
-        def trim():
-            return h[:, :target_time, :]
-
-        def pad():
-            pad_len = target_time - cur_len
-            pad_tensor = tf.zeros(
-                [tf.shape(h)[0], pad_len, tf.shape(h)[2]], dtype=h.dtype
-            )
-            return tf.concat([h, pad_tensor], axis=1)
-
-        h = tf.cond(cur_len >= target_time, trim, pad)
-        out = self.out_conv(h)  # [B, target_time, 1]
-        return out
-
-    def build(self, input_shape):
-        # input_shapeは [ (batch, latent_dim), (batch, cond_dim), target_time ] に対応
-        # 特別な重みを追加しない場合でも build() 呼び出しを明示的にしておく
-        super().build(input_shape)
-
-
-# ---------------------
-# Full model wrapper with loss computation
-# ---------------------
-class WaveCVAE(Model):
-    def __init__(
-        self,
-        latent_dim=LATENT_DIM,
-        cond_dim=COND_DIM,
-        kl_weight=KL_WEIGHT,
-        **kwargs,
-    ):
-        super().__init__(**kwargs)
-        self.encoder = build_wave_encoder(
-            cond_dim=cond_dim, latent_dim=latent_dim
-        )
-        self.cond_dim = cond_dim
-        self.reparam = Reparam()
-        self.decoder = WaveDecoder(cond_dim=cond_dim, latent_dim=latent_dim)
-        self.kl_weight = kl_weight
-        # metrics
+        # メトリクス
         self.loss_tracker = tf.keras.metrics.Mean(name="loss")
         self.recon_tracker = tf.keras.metrics.Mean(name="recon")
+        self.stft_tracker = tf.keras.metrics.Mean(name="stft")
+        self.mel_tracker = tf.keras.metrics.Mean(name="mel")
         self.kl_tracker = tf.keras.metrics.Mean(name="kl")
+        self.mean_mu_tracker = tf.keras.metrics.Mean(name="mean_mu")
+        self.mean_logvar_tracker = tf.keras.metrics.Mean(name="mean_logvar")
 
     @property
     def metrics(self):
-        return [self.loss_tracker, self.recon_tracker, self.kl_tracker]
+        return [self.loss_tracker, self.recon_tracker, self.stft_tracker,
+                self.mel_tracker, self.kl_tracker, self.mean_mu_tracker, self.mean_logvar_tracker]
+
+    def kl_weight(self):
+        step = tf.cast(self.total_steps, tf.float32)
+        s = tf.minimum(1.0, step / tf.cast(self.kl_anneal_steps, tf.float32))
+        return s * self.kl_weight_max
 
     def call(self, inputs, training=False):
-        x, cond = inputs  # x: [B, T, 1]
-        mu, logvar = self.encoder([x, cond], training=training)
-        z = self.reparam([mu, logvar])
-        target_time = tf.shape(x)[1]
-        out = self.decoder(z, cond, target_time, training=training)
-        return out
+            # 柔軟に入力数を判定
+        if len(inputs) == 5:
+            x, _, cond, lx, ly = inputs
+        elif len(inputs) == 3:
+            # outputは無視、長さ情報はダミー
+            x, cond, _ = inputs
+            lx = ly = None
+        elif len(inputs) == 2:
+            x, cond = inputs
+            lx = ly = None
+        else:
+            raise ValueError(f"Unexpected number of inputs: {len(inputs)}")
 
-    def compute_losses(self, x, cond, mask_frames, y):
-        # x, y: [B, N_samples] -> but we assume they are already batched and padded as [B, N]
-        # our encoder expects shape [B, T, 1], so expand dims
-        x_in = tf.expand_dims(x, axis=-1)  # [B, N, 1]
-        mu, logvar = self.encoder([x_in, cond], training=True)
-        z = self.reparam([mu, logvar])
-        target_time = tf.shape(y)[1]
-        y_pred = self.decoder(z, cond, target_time, training=True)  # [B, Ty, 1]
-        # squeeze for stft
-        y_pred_wav = tf.squeeze(y_pred, axis=-1)  # [B, Ty]
-        # ensure y already has shape [B, Ty]
-        recon = stft_loss_masked(y, y_pred_wav, mask_frames)
-        # KL
-        kl_per = -0.5 * (1 + logvar - tf.square(mu) - tf.exp(logvar))
-        kl = tf.reduce_mean(tf.reduce_sum(kl_per, axis=1))
-        total = recon + self.kl_weight * kl
-        return total, recon, kl, y_pred_wav
+        mean, logvar = self.encoder(x, training=training)
+        z = self.reparam(mean, logvar, training=training)
+        y_hat = self.decoder([z, cond], training=training)
+        return y_hat
 
-    def get_config(self):
-        config = super().get_config()
-        config.update(
-            {
-                "latent_dim": self.encoder.get_layer("mu").units,
-                "cond_dim": self.cond_dim,
-                "kl_weight": self.kl_weight,
-            }
-        )
-        return config
+    def train_step(self, data):
+        # data: (x_padded, y_padded, cond, len_x, len_y)
+        x, y, cond, len_x, len_y = data
+        batch_size = tf.shape(x)[0]
+        maxlen_x = tf.shape(x)[1]
+        maxlen_y = tf.shape(y)[1]
 
-    @classmethod
-    def from_config(cls, config):
-        return cls(**config)
-
-
-# ---------------------
-# Dataset builder from your CSV
-# ---------------------
-def build_wave_dataset_from_csv(csv_path, batch_size=BATCH_SIZE):
-    df = pd.read_csv(csv_path)
-    in_paths = df["input_path"].astype(str).values
-    out_paths = df["output_path"].astype(str).values
-    attacks = df["attack"].astype(np.float32).values
-    distortions = df["distortion"].astype(np.float32).values
-    thicknesses = df["thickness"].astype(np.float32).values
-    centers = df["center_tone"].astype(np.float32).values
-
-    ds = tf.data.Dataset.from_tensor_slices(
-        (in_paths, out_paths, attacks, distortions, thicknesses, centers)
-    )
-
-    def _py_load(inp, outp, a, d, t, c):
-        x = load_wav(inp)
-        y = load_wav(outp)
-        return x, y, a, d, t, c
-
-    ds = ds.map(
-        lambda i, o, a, d, t, c: tf.py_function(
-            func=_py_load,
-            inp=[i, o, a, d, t, c],
-            Tout=[
-                tf.float32,
-                tf.float32,
-                tf.float32,
-                tf.float32,
-                tf.float32,
-                tf.float32,
-            ],
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE,
-    )
-
-    # pad waveforms to batch-max length (samples)
-    def to_padded_example(x, y, a, d, t, c):
-        x = tf.cast(x, tf.float32)
-        y = tf.cast(y, tf.float32)
-        cond = tf.stack([a, d, t, c])
-        # return sample-level (x, y, cond) ; actual padding handled by padded_batch
-        return x, y, cond
-
-    ds = ds.map(to_padded_example, num_parallel_calls=tf.data.AUTOTUNE)
-
-    # padded_batch: pad waveforms to same sample length within each batch
-    ds = ds.padded_batch(
-        batch_size,
-        padded_shapes=([None], [None], [COND_DIM]),
-        padding_values=(0.0, 0.0, 0.0),
-    )
-    ds = ds.map(
-        lambda x, y, cond: _post_batch_map(x, y, cond),
-        num_parallel_calls=tf.data.AUTOTUNE,
-    )
-    return ds.prefetch(tf.data.AUTOTUNE)
-
-
-def _post_batch_map(x_batch, y_batch, cond_batch):
-    """
-    After padded_batch: x_batch, y_batch are [B, N_samples]
-    We need to produce mask_frames for y_batch and lengths if needed.
-    """
-    nonzero = tf.cast(tf.greater(tf.abs(y_batch), 1e-7), tf.int32)
-    lengths = tf.reduce_sum(nonzero, axis=1)  # [B]
-    max_len = tf.shape(y_batch)[1]
-    mask_frames = make_mask_from_length(lengths, max_len)  # [B, T_frames]
-    return (x_batch, cond_batch, mask_frames), y_batch
-
-
-# ---------------------
-CHECKPOINT_DIR = "checkpoints"
-CHECKPOINT_PATH = os.path.join(CHECKPOINT_DIR, "wavecvae.weights.h5")
-MODEL_PATH = os.path.join(CHECKPOINT_DIR, "wavecvae.model.keras")
-PROGRESS_PATH = os.path.join(CHECKPOINT_DIR, "progress.json")
-
-
-# ---------------------
-# Training loop
-# ---------------------
-def train(csv_path):
-    os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    ds = build_wave_dataset_from_csv(csv_path, batch_size=BATCH_SIZE)
-    model = WaveCVAE(
-        latent_dim=LATENT_DIM, cond_dim=COND_DIM, kl_weight=KL_WEIGHT
-    )
-    opt = tf.keras.optimizers.Adam(LR)
-
-    # ===== モデル初期化 =====
-    for batch in ds.take(1):
-        (x_batch, cond_batch, mask_frames), y_batch = batch
-        input_shape = (
-            (None,) + tuple(x_batch.shape[1:]),
-            (None,) + tuple(cond_batch.shape[1:]),
-            (None,) + tuple(mask_frames.shape[1:]),
-        )
-        model.build(input_shape)
-        _ = model.compute_losses(x_batch, cond_batch, mask_frames, y_batch)
-        break
-    print("✅ モデルを初期化しました。")
-    for batch in ds.take(1):
-        (x_batch, cond_batch, mask_frames), y_batch = batch
-        _ = model.compute_losses(x_batch, cond_batch, mask_frames, y_batch)
-        break
-    print("✅ モデル構造をビルドしました。")
-
-    # --- 前回の進捗を読み込み ---
-    start_epoch, start_step = 0, 0
-    if os.path.exists(PROGRESS_PATH) and os.path.exists(CHECKPOINT_PATH):
-        with open(PROGRESS_PATH, "r") as f:
-            progress = json.load(f)
-        start_epoch = progress.get("epoch", 0)
-        start_step = progress.get("step", 0)
-        print(
-            f"🔁 前回のチェックポイントから再開します: epoch={start_epoch}, step={start_step}"
-        )
-        model.load_weights(CHECKPOINT_PATH)
-    else:
-        print("🚀 新規学習を開始します")
-
-    @tf.function
-    def step(model, opt, batch, global_step, anneal_steps, free_nats=0.3):
-        (x_batch, cond_batch, mask_frames), y_batch = batch
-        kl_weight = linear_anneal(global_step, anneal_steps)
+        # 元の mask（最大長で作られているが後で min_len に合わせる）
+        mask_x = tf.cast(tf.expand_dims(tf.sequence_mask(len_x, maxlen=maxlen_x), -1), tf.float32)
+        mask_y_full = tf.cast(tf.expand_dims(tf.sequence_mask(len_y, maxlen=maxlen_y), -1), tf.float32)
 
         with tf.GradientTape() as tape:
-            total, recon, kl, y_pred = model.compute_losses(
-                x_batch, cond_batch, mask_frames, y_batch
-            )
-            kl_adj = tf.maximum(kl, free_nats)
-            loss_for_backprop = recon + kl_weight * kl_adj
+            mean, logvar = self.encoder(x, training=True)  # [B, Tz, D]
+            z = self.reparam(mean, logvar, training=True)  # [B, Tz, D]
+            y_hat = self.decoder([z, cond], training=True)  # [B, T_hat, 1]
 
-        grads = tape.gradient(loss_for_backprop, model.trainable_variables)
-        opt.apply_gradients(zip(grads, model.trainable_variables))
+            # --- 重要: y と y_hat の時間次元を揃える ---
+            len_y_hat = tf.shape(y_hat)[1]
+            min_len = tf.minimum(maxlen_y, len_y_hat)
+            # 切り詰め（両方とも min_len に揃える）
+            y_trim = y[:, :min_len, :]
+            yhat_trim = y_hat[:, :min_len, :]
+            # mask を min_len に合わせる
+            mask_y = tf.cast(tf.expand_dims(tf.sequence_mask(len_y, maxlen=min_len), -1), tf.float32)
+            # ------------------------------------------------
 
-        model.loss_tracker.update_state(loss_for_backprop)
-        model.recon_tracker.update_state(recon)
-        model.kl_tracker.update_state(kl)
+            # waveform L1 (mask target length)
+            wave_diff = tf.abs((y_trim - yhat_trim) * mask_y)
+            recon_loss = tf.reduce_sum(wave_diff) / (tf.reduce_sum(mask_y) + 1e-9)
 
-        return total, recon, kl, kl_adj, kl_weight
+            # STFT + complex losses: use squeeze to [B, T]
+            y_s = tf.squeeze(y_trim * mask_y, -1)
+            yhat_s = tf.squeeze(yhat_trim * mask_y, -1)
+            stft_terms = []
+            for n_fft in STFT_FFTS:
+                hop = max(64, n_fft // 4)
+                stft_terms.append(stft_complex_l1(y_s, yhat_s, n_fft, hop) + log_mag_l1(y_s, yhat_s, n_fft, hop))
+            stft_loss = tf.add_n(stft_terms) / float(len(stft_terms))
 
-        # --- 学習ループ ---
-    global_step = start_epoch * tf.data.experimental.cardinality(ds).numpy() + start_step
-    anneal_frac = 0.5
-    total_steps = EPOCHS * tf.data.experimental.cardinality(ds).numpy()
-    anneal_steps = int(total_steps * anneal_frac)
+            # mel loss (single resolution)
+            mel_loss = mel_l1(y_s, yhat_s, n_fft=1024, hop=256, n_mels=MEL_BINS)
 
-    def linear_anneal(global_step, anneal_steps, kl_start=1e-3, kl_end=1.0):
-    # Tensor に変換して float32 に揃える
-        global_step = tf.cast(global_step, tf.float32)
-        anneal_steps = tf.cast(anneal_steps, tf.float32)
-        
-        fraction = tf.minimum(
-            tf.constant(1.0, dtype=tf.float32),
-            global_step / tf.maximum(tf.constant(1.0, dtype=tf.float32), anneal_steps)
-        )
-        
-        return kl_start + fraction * (kl_end - kl_start)
+            # KL per-dim per-time-step
+            kl_per = -0.5 * (1.0 + logvar - tf.square(mean) - tf.exp(logvar))  # [B, Tz, D]
+            # sum over dim -> [B, Tz]
+            kl_time = tf.reduce_sum(kl_per, axis=-1)
+            # apply free bits: clip with lower bound FREE_BITS * D
+            free_bits_total = self.free_bits * tf.cast(self.latent_dim, tf.float32)
+            # we take mean over time and batch after applying free bits
+            kl_time_clipped = tf.maximum(kl_time, free_bits_total)
+            kl_loss = tf.reduce_mean(kl_time_clipped)
 
-    FREE_NATS = 0.2  # ← まずは 0.1〜0.5 の間で試す
+            kl_w = self.kl_weight()
+            loss = self.wave_weight * recon_loss + self.stft_weight * stft_loss + self.mel_weight * mel_loss + kl_w * kl_loss
 
-    for epoch in range(start_epoch, EPOCHS):
-        for step_i, batch in enumerate(ds):
-            if epoch == start_epoch and step_i < start_step:
-                global_step += 1
-                continue
+        grads = tape.gradient(loss, self.trainable_variables)
+        # 勾配ノルムクリッピング
+        grads, _ = tf.clip_by_global_norm(grads, 5.0)
+        self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
-            total, recon, kl, kl_adj, kl_weight = step(
-                model, opt, batch, global_step, anneal_steps, FREE_NATS
-            )
+        # step 更新とメトリクス
+        self.total_steps.assign_add(1)
+        self.loss_tracker.update_state(loss)
+        self.recon_tracker.update_state(recon_loss)
+        self.stft_tracker.update_state(stft_loss)
+        self.mel_tracker.update_state(mel_loss)
+        self.kl_tracker.update_state(kl_loss)
+        self.mean_mu_tracker.update_state(tf.reduce_mean(mean))
+        self.mean_logvar_tracker.update_state(tf.reduce_mean(logvar))
 
-            if step_i % 10 == 0:
-                tf.print(
-                    "Epoch", epoch + 1, "Step", step_i,
-                    "loss", total,
-                    "recon", recon,
-                    "kl", kl, "kl_adj", kl_adj, "kl_w", kl_weight
-                )
-                model.save_weights(CHECKPOINT_PATH)
-                with open(PROGRESS_PATH, "w") as f:
-                    json.dump({"epoch": epoch, "step": step_i}, f)
-                print(f"💾 チェックポイントを保存しました: {CHECKPOINT_PATH}")
+        return {
+            "loss": self.loss_tracker.result(),
+            "recon": self.recon_tracker.result(),
+            "stft": self.stft_tracker.result(),
+            "mel": self.mel_tracker.result(),
+            "kl": self.kl_tracker.result(),
+            "kl_w": kl_w,
+            "mean_mu": self.mean_mu_tracker.result(),
+            "mean_logvar": self.mean_logvar_tracker.result(),
+        }
 
-            global_step += 1
-        tf.print("Epoch", epoch + 1, "avg loss", model.loss_tracker.result())
-        mu, logvar = model.encoder([x_batch[..., None], cond_batch], training=False)
-        print("mean std:", tf.math.reduce_std(mu).numpy(), "logvar mean:", tf.reduce_mean(logvar).numpy())
-        # reset metrics
-        model.loss_tracker.reset_state()
-        model.recon_tracker.reset_state()
-        model.kl_tracker.reset_state()
-        # epoch終了時にも進捗保存
-        with open(PROGRESS_PATH, "w") as f:
-            json.dump({"epoch": epoch + 1, "step": 0}, f)
-        model.save_weights(CHECKPOINT_PATH)
-        model.save(MODEL_PATH)
-        print(f"✅ エポック {epoch + 1} の重みを保存しました")
+    def infer(self, x, cond, len_x):
+        # x: [T,1] numpy or tensor -> pad to batch 1 and call encoder+decoder (use mean)
+        if isinstance(x, np.ndarray):
+            x = tf.expand_dims(x, 0)
+        if len(x.shape) == 2:
+            x = tf.expand_dims(x, 0)
+        # build mask if needed
+        mean, logvar = self.encoder(x, training=False)
+        z = mean  # deterministic
+        y_hat = self.decoder([z, cond], training=False)
+        return y_hat.numpy()[0, :len_x, 0]
+
+# -------------------------
+# モデル作成と学習ループ
+# -------------------------
+def make_and_train():
+    # ===============================
+    # データセット構築
+    # ===============================
+    ds = make_dataset_from_csv(LABEL_CSV, batch_size=BATCH_SIZE)
+
+    # ===============================
+    # モデル構築
+    # ===============================
+    enc = build_encoder(latent_dim=LATENT_DIM, channels=ENC_CHANNELS, down_factors=DOWNSAMPLE_FACTORS)
+    dec = build_decoder(latent_dim=LATENT_DIM, channels=DEC_CHANNELS,
+                        up_factors=DOWNSAMPLE_FACTORS[::-1], cond_dim=4)
+    model = WaveTimeConditionalCVAE(
+        enc, dec, latent_dim=LATENT_DIM,
+        kl_anneal_steps=ANNEAL_STEPS, kl_weight_max=KL_WEIGHT_MAX, free_bits=FREE_BITS
+    )
+
+    opt = tf.keras.optimizers.Adam(LEARNING_RATE)
+    model.compile(optimizer=opt)
+
+    # ===============================
+    # チェックポイント設定
+    # ===============================
+    ckpt_dir = "checkpoints_cvae"
+    os.makedirs(ckpt_dir, exist_ok=True)
+
+    # データセットから1バッチを取ってbuild
+    sample_batch = next(iter(ds.take(1)))
+    x_sample, y_sample, c_sample, lx, ly = sample_batch
+    _ = model([x_sample, c_sample, y_sample])  # ビルドだけ行う
+
+    # 最新の重みファイルを探索
+    ckpt_list = sorted(glob.glob(os.path.join(ckpt_dir, "cvae_*.weights.h5")))
+    if ckpt_list:
+        latest_ckpt = ckpt_list[-1]
+        print(f"[info] 最新の重みを読み込みます: {latest_ckpt}")
+        model.load_weights(latest_ckpt)
+    else:
+        print("[info] チェックポイントが見つかりません。新規学習を開始します。")
+
+    # ===============================
+    # コールバック設定
+    # ===============================
+    checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
+        os.path.join(ckpt_dir, "cvae_{epoch:03d}.weights.h5"),
+        save_weights_only=True,
+        save_freq='epoch'
+    )
+
+    reduce_lr = tf.keras.callbacks.ReduceLROnPlateau(
+        monitor='loss', factor=0.5, patience=10, min_lr=1e-7
+    )
+
+    class CollapseMonitor(tf.keras.callbacks.Callback):
+        def on_epoch_end(self, epoch, logs=None):
+            mu = logs.get('mean_mu')
+            lv = logs.get('mean_logvar')
+            kl = logs.get('kl')
+            print(f"[monitor] epoch={epoch:03d} mean_mu={mu:.6f} mean_logvar={lv:.6f} kl(mean)={kl:.6f}")
+            if lv is not None and lv < -10.0:
+                print("[warning] mean logvar が極端に小さい -> 潜在崩壊の可能性")
+
+    cb_list = [checkpoint_cb, reduce_lr, CollapseMonitor()]
+
+    # ===============================
+    # 学習開始
+    # ===============================
+    print("[info] 学習を開始します...")
+    model.fit(ds, epochs=EPOCHS, callbacks=cb_list)
+
+    # ===============================
+    # 最終重み保存
+    # ===============================
+    final_path = os.path.join(ckpt_dir, "final_weights.h5")
+    model.save_weights(final_path)
+    print(f"[info] 最終重みを保存しました: {final_path}")
 
     return model
 
+# -------------------------
+# 推論サンプル生成関数
+# -------------------------
+def transform_single_file(model, input_wav_path, cond_vector, out_path):
+    x = load_wav(input_wav_path)
+    cond = np.array(cond_vector, dtype=np.float32)
+    cond = np.expand_dims(cond, 0)  # batch dim
+    x_in = np.expand_dims(x, -1).astype(np.float32)
+    y_hat = model.infer(x_in, cond, len(x))
+    # 出力を適切な振幅に戻す（もしトレーニングでRMS調整しているなら逆を行う）
+    # ここでは単純に出力を -1..1 にクリップして保存
+    write_wav(out_path, y_hat, sr=SR)
+    print(f"Saved {out_path}")
 
+# -------------------------
+# エントリポイント
+# -------------------------
 if __name__ == "__main__":
-    model = train("datasets/labels.csv")
+    # 学習
+    model = make_and_train()
+
+    # 例: 推論（CSVの最初の行をテスト）
+    df = pd.read_csv(LABEL_CSV)
+    first = df.iloc[0]
+    cond = [first['attack'], first['distortion'], first['thickness'], first['center_tone']]
+    transform_single_file(model, first['input_path'], cond, out_path="example_transformed.wav")
