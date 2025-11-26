@@ -1,82 +1,89 @@
-import gradio as gr
+import os
+os.environ["OMP_NUM_THREADS"] = "1"
+os.environ["TF_NUM_INTRAOP_THREADS"] = "1"
+os.environ["TF_NUM_INTEROP_THREADS"] = "1"
+
+import streamlit as st
 import tensorflow as tf
 import numpy as np
 import librosa
+import tempfile
 import soundfile as sf
-from train import WaveCVAE
+
+from train import (
+    build_encoder, build_decoder,
+    WaveTimeConditionalCVAE
+)
+
+tf.config.threading.set_inter_op_parallelism_threads(1)
+tf.config.threading.set_intra_op_parallelism_threads(1)
 
 SR = 32000
-
-# ハイパーパラメータは学習時と同じにする
-LATENT_DIM = 64
-COND_DIM = 4
-KL_WEIGHT = 1e-3  # 学習時に使った値
-
-# モデル構築
-model = WaveCVAE(
-    latent_dim=LATENT_DIM,
-    cond_dim=COND_DIM,
-    kl_weight=KL_WEIGHT,
-)
-
-# -------------------------------
-# モデルを「ビルド」してから重みをロード
-# -------------------------------
-# ダミー入力でshapeを確定させる
-dummy_audio = tf.zeros((1, 16000, 1), dtype=tf.float32)  # 長さは任意
-dummy_cond = tf.zeros((1, COND_DIM), dtype=tf.float32)
-output = model([dummy_audio, dummy_cond], training=False)  # ← ここが重要
-print("出力 shape:", output.shape)
-print("出力の平均値:", tf.reduce_mean(output).numpy())
-
-# 学習済み重みをロード
-model.load_weights("checkpoints/wavecvae.weights.h5")
-print("✅ モデル重みをロードしました")
-
-# 重み統計を出力
-total_params = 0
-for w in model.weights:
-    mean_val = tf.reduce_mean(w).numpy()
-    total_params += np.prod(w.shape)
-    print(f"{w.name}: mean={mean_val:.5f}, shape={w.shape}")
-
-print(f"総パラメータ数: {total_params}")
+CKPT = "checkpoints_cvae/cvae_164.weights.h5"
 
 
-# 生成関数（エンコード→デコード）
-def generate(input_wav: gr.File, cond1, cond2, cond3, cond4):
-    if input_wav is None:
-        return None
-    y, sr = librosa.load(input_wav.name, sr=SR)
-    y = np.expand_dims(y, axis=(0, -1))  # [1, T, 1]
+st.set_page_config(layout="wide")
+st.title("WaveTime Conditional CVAE – Inference UI")
 
-    cond = np.array([[cond1, cond2, cond3, cond4]], dtype=np.float32)
+# ===== UI =====
+uploaded_file = st.file_uploader("音声ファイルをアップロード (.wav)", type=["wav"])
 
-    # エンコード
-    mu, logvar = model.encoder([y, cond], training=False)
-    eps = tf.random.normal(tf.shape(mu))
-    z = mu + tf.exp(0.5 * logvar) * eps
+cond_attack = st.slider("Attack", 0.0, 1.0, 0.0)
+cond_dist   = st.slider("Distortion", 0.0, 1.0, 0.0)
+cond_thick  = st.slider("Thickness", 0.0, 1.0, 0.0)
+cond_center = st.slider("Center", 0.0, 1.0, 0.0)
 
-    # デコード
-    target_time = y.shape[1]
-    y_pred = model.decoder(z, cond, target_time=target_time, training=False)
-    y_pred = tf.squeeze(y_pred).numpy()
+cond = tf.constant([[cond_attack, cond_dist, cond_thick, cond_center]], dtype=tf.float32)
 
-    sf.write("preview.wav", y_pred, SR)
-    return "preview.wav"
+run_button = st.button("推論実行")
 
+# ===== 処理 =====
+if uploaded_file and run_button:
+    with st.spinner("音声読み込み中..."):
+        with tempfile.NamedTemporaryFile(delete=False) as tmp:
+            tmp.write(uploaded_file.read())
+            tmp_path = tmp.name
 
-ui = gr.Interface(
-    fn=generate,
-    inputs=[
-        gr.File(label="Input Wav"),
-        gr.Slider(0, 1, value=0.5, label="Attack"),
-        gr.Slider(0, 1, value=0.5, label="Distortion"),
-        gr.Slider(0, 1, value=0.5, label="Thickness"),
-        gr.Slider(0, 1, value=0.5, label="Center_tone"),
-    ],
-    outputs=gr.Audio(label="Generated / Converted Audio"),
-    title="HappyHardcore WaveCVAE Synth",
-    description="WAVファイルを潜在空間に変換し、条件ベクトルで音色変換します。",
-)
-ui.launch()
+        wav, sr = librosa.load(tmp_path, sr=SR)
+        wav = np.expand_dims(wav, axis=[0, -1])  # [1, T, 1]
+        T = wav.shape[1]
+
+        st.success(f"Loaded audio (T={T})")
+
+    # ===== モデル構築 =====
+    with st.spinner("モデル構築 & ビルド中..."):
+        encoder = build_encoder()
+        decoder = build_decoder()
+        model = WaveTimeConditionalCVAE(encoder, decoder)
+
+        x_in = tf.constant(wav, dtype=tf.float32)
+        y_in = tf.zeros_like(x_in)
+        lx = tf.constant([T], dtype=tf.int32)
+        ly = tf.constant([T], dtype=tf.int32)
+
+        _ = model((x_in, y_in, cond, lx, ly), training=False)
+        model.load_weights(CKPT)
+
+    st.success("モデル準備完了")
+
+    # ===== 推論 =====
+    with st.spinner("推論中..."):
+        mean, logvar = model.encoder(x_in, training=False)
+        eps = tf.random.normal(shape=tf.shape(mean))
+        z = mean + tf.exp(0.5 * logvar) * eps * 0.1
+        y_hat = model.decoder([z, cond], training=False)
+        y_hat = tf.squeeze(y_hat).numpy()
+
+    # ===== 出力 =====
+    st.subheader("Input Audio")
+    st.audio(wav.squeeze(), sample_rate=SR)
+
+    st.subheader("Generated Audio")
+    st.audio(y_hat, sample_rate=SR)
+
+    sf.write("output.wav", y_hat, SR)
+    st.download_button(
+        "生成音声をダウンロード",
+        data=open("output.wav", "rb"),
+        file_name="generated.wav"
+    )
