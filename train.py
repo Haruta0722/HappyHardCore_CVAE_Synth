@@ -16,17 +16,17 @@ import tensorflow.keras.layers as layers
 # -------------------------
 SR = 32000
 BATCH_SIZE = 4            # 長い波形なら小さめに
-LATENT_DIM = 64           # 時間方向の潜在次元（per time-step）
+LATENT_DIM = 128         # 時間方向の潜在次元（per time-step）
 ENC_CHANNELS = [64, 128, 256]
 DOWNSAMPLE_FACTORS = [4, 4, 4]   # 合計縮小率 = 64
 DEC_CHANNELS = ENC_CHANNELS[::-1]
 LEARNING_RATE = 1e-4
 EPOCHS = 200
 WAVE_L1_WEIGHT = 1.0
-STFT_WEIGHT = 1.0
-MEL_WEIGHT = 1.0
-KL_WEIGHT_MAX = 1.0
-ANNEAL_STEPS = 100000    # とてもゆっくり増やす（posterior collapse防止）
+STFT_WEIGHT = 1.2
+MEL_WEIGHT = 3.0
+KL_WEIGHT_MAX = 4.0
+ANNEAL_STEPS = 200000    # とてもゆっくり増やす（posterior collapse防止）
 FREE_BITS = 0.5          # free bits（nats） per latent-dimension (大きさは調整)
 STFT_FFTS = [512, 1024, 2048]
 MEL_BINS = 80
@@ -111,18 +111,24 @@ def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, sh
 class FiLM(layers.Layer):
     def __init__(self, channels, cond_dim=4, name=None):
         super().__init__(name=name)
-        self.channels = channels
-        self.cond_dim = cond_dim
-        # produce scale and shift
-        self.dense = layers.Dense(channels * 2, name=(name or "film_dense"))
+        self.channels = int(channels)
+        self.cond_dim = int(cond_dim)
+        # cond 表現を強化する MLP
+        self.net = tf.keras.Sequential([
+            layers.Dense(128, activation="relu"),
+            layers.Dense(128, activation="relu"),
+            layers.Dense(self.channels * 2,
+                         kernel_initializer="zeros",
+                         bias_initializer="zeros")  # 最初は変化させない
+        ])
 
-    def call(self, x, cond):
-        # x: [B, T, C], cond: [B, cond_dim]
-        gamma_beta = self.dense(cond)  # [B, 2*C]
-        gamma, beta = tf.split(gamma_beta, 2, axis=-1)
-        # expand to time dimension
-        gamma = tf.expand_dims(gamma, 1)
-        beta = tf.expand_dims(beta, 1)
+    def call(self, inputs):
+        # inputs: [x, cond]
+        x, cond = inputs
+        gb = self.net(cond)                       # [B, 2*C]
+        gamma, beta = tf.split(gb, 2, axis=-1)    # each [B, C]
+        gamma = gamma[:, None, :]                 # [B,1,C]
+        beta  = beta[:, None, :]                  # [B,1,C]
         return x * (1.0 + gamma) + beta
 
 def build_encoder(latent_dim=LATENT_DIM, channels=ENC_CHANNELS, down_factors=DOWNSAMPLE_FACTORS):
@@ -137,24 +143,81 @@ def build_encoder(latent_dim=LATENT_DIM, channels=ENC_CHANNELS, down_factors=DOW
     logvar = layers.Conv1D(latent_dim, kernel_size=3, padding='same', name='enc_logvar')(x)
     return tf.keras.Model(inp, [mean, logvar], name='time_encoder')
 
-def build_decoder(latent_dim=LATENT_DIM, channels=DEC_CHANNELS, up_factors=DOWNSAMPLE_FACTORS[::-1], cond_dim=4):
-    z_in = layers.Input(shape=(None, latent_dim), name='z_in')
-    cond = layers.Input(shape=(cond_dim,), name='cond_in')
-    x = layers.Conv1D(channels[0], kernel_size=3, padding='same', activation='relu', name='dec_proj')(z_in)
-    film_layers = []
-    for i, f in enumerate(up_factors):
-        x = layers.UpSampling1D(size=f, name=f'dec_upsample_{i}')(x)
-        ch = channels[min(i, len(channels)-1)]
-        x = layers.Conv1D(ch, kernel_size=9, padding='same', activation='relu', name=f'dec_conv_{i}_a')(x)
-        x = layers.Conv1D(ch, kernel_size=9, padding='same', activation='relu', name=f'dec_conv_{i}_b')(x)
-        x = layers.BatchNormalization(name=f'dec_bn_{i}')(x)
-        # FiLM 注入
-        film = FiLM(ch, cond_dim=cond_dim, name=f'film_{i}')
-        x = film(x, cond)
-        film_layers.append(film)
-    out = layers.Conv1D(1, kernel_size=7, padding='same', activation='tanh', name='dec_out')(x)
-    return tf.keras.Model([z_in, cond], out, name='time_decoder')
+def residual_block(x, channels, dilation=1, name=None):
+    """Stable dilated residual block.
+       Conv -> ReLU -> Conv(zeros) -> scale -> add."""
+    
+    # 1: dilated conv
+    h = layers.Conv1D(
+        filters=channels,
+        kernel_size=3,
+        dilation_rate=dilation,
+        padding="same",
+        activation=None,
+        name=f"{name}_dilconv"
+    )(x)
+    h = layers.Activation("relu", name=f"{name}_dil_relu")(h)
 
+    # 2: final conv with ZERO initialization
+    h = layers.Conv1D(
+        filters=channels,
+        kernel_size=1,
+        padding="same",
+        activation=None,
+        name=f"{name}_proj",
+        kernel_initializer="zeros",
+        bias_initializer="zeros"
+    )(h)
+
+    # 3: residual scaling (0.1 is standard)
+    h = layers.Lambda(lambda t: 0.1 * t, name=f"{name}_scale")(h)
+
+    # 4: skip add (NO ReLU here)
+    out = layers.Add(name=f"{name}_add")([x, h])
+
+    return out
+
+# -------------------------
+# Decoder 全体（差し替え用）
+# -------------------------
+def build_decoder(
+    latent_dim=128,
+    cond_dim=4,
+    channels=[256, 128, 64],     # DEC_CHANNELS 相当
+    up_factors=[4, 4, 4],        # 合計 64
+    n_dilated_per_stage=6        # 各アップ段に入れる dilated 層数（変更可）
+):
+    z_in = layers.Input(shape=(None, latent_dim), name="dec_z_in")
+    cond_in = layers.Input(shape=(cond_dim,), name="dec_cond_in")
+
+    # ----- 入力プロジェクション -----
+    x = layers.Conv1D(channels[0], kernel_size=3, padding="same", activation=None, name="dec_proj")(z_in)
+    x = FiLM(channels[0], cond_dim=cond_dim, name="dec_proj_film")([x, cond_in])
+    x = layers.Activation("relu", name="dec_proj_relu")(x)
+
+    # ----- 各アップサンプルブロック -----
+    for stage_idx, factor in enumerate(up_factors):
+        ch = channels[min(stage_idx, len(channels) - 1)]
+        x = layers.Conv1DTranspose(filters=ch, kernel_size=factor*2, strides=factor, padding="same")(x)
+        x = FiLM(ch, cond_dim=cond_dim, name=f"dec_up_film_s{stage_idx}")([x, cond_in])
+        x = layers.Activation("relu", name=f"dec_up_relu_s{stage_idx}")(x)
+
+        # dilated residual stack (各ステージごとに複数)
+        # dilations: 1,2,4,8,... を使う（n_dilated_per_stage 個）
+        for i in range(n_dilated_per_stage):
+            d = 2 ** (i % 6)  # 1,2,4,8,16,32 を繰り返す（必要なら変える）
+            x = residual_block(x, channels=ch, dilation=d, name=f"dec_stage{stage_idx}_res{i}")
+
+        # stag-end にもう一回 FiLM して安定化
+        x = FiLM(ch, cond_dim=cond_dim, name=f"dec_stage{stage_idx}_postfilm")([x, cond_in])
+        x = layers.Activation("relu", name=f"dec_stage{stage_idx}_post_relu")(x)
+
+    # ----- 出力プロジェクション -----
+    x = layers.Conv1D(64, kernel_size=7, padding="same", activation="relu", name="dec_final_conv1")(x)
+    out = layers.Conv1D(1, kernel_size=7, padding="same", activation="tanh", name="dec_final_out")(x)
+    # NaN/Inf safe guard を Lambda で包む
+
+    return tf.keras.Model([z_in, cond_in], out, name="time_decoder_improved")
 # -------------------------
 # Reparameterize（time-distributed）
 # -------------------------
@@ -169,25 +232,48 @@ class ReparamTime(layers.Layer):
 # -------------------------
 # Loss utilities: complex STFT L1, log-mag L1, mel L1
 # -------------------------
-def stft_complex_l1(y, y_hat, fft_size, hop_size):
-    # y: [B, T], y_hat: [B, T]
+import tensorflow as tf
+
+# -----------------------------------
+# 安全な complex STFT L1
+# -----------------------------------
+def stft_complex_l1(y, y_hat, fft_size, hop_size, eps=1e-7):
     S = tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
     S_hat = tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
-    return tf.reduce_mean(tf.abs(S - S_hat))
 
-def log_mag_l1(y, y_hat, fft_size, hop_size):
-    S = tf.abs(tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
-    S_hat = tf.abs(tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
-    return tf.reduce_mean(tf.abs(tf.math.log(S + 1e-7) - tf.math.log(S_hat + 1e-7)))
+    # magnitude only
+    S_mag = tf.maximum(tf.abs(S), eps)
+    S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
 
-def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS):
-    # compute mel via linear_to_mel_weight_matrix
-    S = tf.abs(tf.signal.stft(y, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
-    S_hat = tf.abs(tf.signal.stft(y_hat, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
-    mel_mat = get_mel_matrix(n_fft, n_mels=n_mels)
-    mel = tf.tensordot(S, mel_mat, axes=[-1, 0])  # [B, frames, mels]
-    mel_hat = tf.tensordot(S_hat, mel_mat, axes=[-1, 0])
-    return tf.reduce_mean(tf.abs(tf.math.log(mel + 1e-7) - tf.math.log(mel_hat + 1e-7)))
+    return tf.reduce_mean(tf.abs(S_mag - S_hat_mag))
+
+
+def log_mag_l1(y, y_hat, fft_size, hop_size, eps=1e-7):
+    S = tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+    S_hat = tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+
+    S_mag = tf.maximum(tf.abs(S), eps)
+    S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
+
+    return tf.reduce_mean(tf.abs(tf.math.log(S_mag) - tf.math.log(S_hat_mag)))
+
+
+def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS, eps=1e-7):
+    S = tf.signal.stft(y, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+    S_hat = tf.signal.stft(y_hat, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+
+    S_mag = tf.maximum(tf.abs(S), eps)
+    S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
+
+    mel_mat = tf.cast(get_mel_matrix(n_fft, n_mels=n_mels), S_mag.dtype)
+
+    mel = tf.matmul(S_mag, mel_mat)
+    mel_hat = tf.matmul(S_hat_mag, mel_mat)
+
+    mel = tf.maximum(mel, eps)
+    mel_hat = tf.maximum(mel_hat, eps)
+
+    return tf.reduce_mean(tf.abs(tf.math.log(mel) - tf.math.log(mel_hat)))
 
 # -------------------------
 # CVAE 主クラス（カスタム train_step）
@@ -195,7 +281,7 @@ def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS):
 class WaveTimeConditionalCVAE(tf.keras.Model):
     def __init__(self, encoder, decoder, latent_dim=LATENT_DIM,
                  kl_anneal_steps=ANNEAL_STEPS, kl_weight_max=KL_WEIGHT_MAX,
-                 free_bits=FREE_BITS,
+                 free_bits=FREE_BITS, steps_per_epoch = 243, initial_epoch = 0,
                  wave_weight=WAVE_L1_WEIGHT, stft_weight=STFT_WEIGHT, mel_weight=MEL_WEIGHT):
         super().__init__()
         self.encoder = encoder
@@ -208,7 +294,11 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
         self.wave_weight = wave_weight
         self.stft_weight = stft_weight
         self.mel_weight = mel_weight
-        self.total_steps = tf.Variable(0, dtype=tf.int32, trainable=False)
+        # total_stepsをtf.Variableで管理
+        initial_steps = initial_epoch * (steps_per_epoch or 0)
+        self.total_steps = tf.Variable(initial_steps, dtype=tf.int64, trainable=False, name="total_steps")
+
+        print(f"[info] total_steps 初期化: {int(self.total_steps.numpy())}")
 
         # メトリクス
         self.loss_tracker = tf.keras.metrics.Mean(name="loss")
@@ -227,8 +317,8 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
     def kl_weight(self):
         step = tf.cast(self.total_steps, tf.float32)
         s = tf.minimum(1.0, step / tf.cast(self.kl_anneal_steps, tf.float32))
-        return s * self.kl_weight_max
-
+        return s * self.kl_weight_max 
+    
     def call(self, inputs, training=False):
             # 柔軟に入力数を判定
         if len(inputs) == 5:
@@ -301,7 +391,7 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
             kl_loss = tf.reduce_mean(kl_time_clipped)
 
             kl_w = self.kl_weight()
-            loss = self.wave_weight * recon_loss + self.stft_weight * stft_loss + self.mel_weight * mel_loss + kl_w * kl_loss
+            loss = self.wave_weight * recon_loss + self.stft_weight * stft_loss + self.mel_weight * mel_loss + kl_w * kl_loss 
 
         grads = tape.gradient(loss, self.trainable_variables)
         # 勾配ノルムクリッピング
@@ -369,21 +459,41 @@ def make_and_train():
     # ===============================
     ckpt_dir = "checkpoints_cvae"
     os.makedirs(ckpt_dir, exist_ok=True)
-
-    # データセットから1バッチを取ってbuild
+       # データセットから1バッチを取ってbuild
     sample_batch = next(iter(ds.take(1)))
     x_sample, y_sample, c_sample, lx, ly = sample_batch
     _ = model([x_sample, c_sample, y_sample])  # ビルドだけ行う
 
     # 最新の重みファイルを探索
+
     ckpt_list = sorted(glob.glob(os.path.join(ckpt_dir, "cvae_*.weights.h5")))
+    initial_epoch = 0
+
     if ckpt_list:
         latest_ckpt = ckpt_list[-1]
         print(f"[info] 最新の重みを読み込みます: {latest_ckpt}")
         model.load_weights(latest_ckpt)
+
+        try:
+            initial_epoch = int(os.path.basename(latest_ckpt).split("_")[1].split(".")[0])
+            print(f"[info] 再開エポック: {initial_epoch}")
+        except Exception as e:
+            print(f"[warn] エポック番号の抽出に失敗しました: {e}")
     else:
         print("[info] チェックポイントが見つかりません。新規学習を開始します。")
 
+    # ===============================
+    # total_steps の再設定（重要）
+    # ===============================
+    # 1エポックあたりのステップ数を求める
+    steps_per_epoch = 243
+
+    # total_steps が __init__ で定義されている場合のみ実行
+    if hasattr(model, "total_steps"):
+        model.total_steps.assign(initial_epoch * steps_per_epoch)
+        print(f"[info] total_steps を {int(model.total_steps.numpy())} に設定しました")
+    else:
+        print("[warn] model に total_steps が存在しません。クラス側に tf.Variable を定義してください。")
     # ===============================
     # コールバック設定
     # ===============================
@@ -409,10 +519,17 @@ def make_and_train():
     cb_list = [checkpoint_cb, reduce_lr, CollapseMonitor()]
 
     # ===============================
+    # モデルのbuild
+    # ===============================
+    sample_batch = next(iter(ds.take(1)))
+    x_sample, y_sample, c_sample, lx, ly = sample_batch
+    _ = model([x_sample, c_sample, y_sample])  # ビルド
+
+    # ===============================
     # 学習開始
     # ===============================
     print("[info] 学習を開始します...")
-    model.fit(ds, epochs=EPOCHS, callbacks=cb_list)
+    model.fit(ds, epochs=EPOCHS, callbacks=cb_list, initial_epoch=initial_epoch)
 
     # ===============================
     # 最終重み保存
