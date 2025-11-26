@@ -3,8 +3,8 @@ import matplotlib.pyplot as plt
 import librosa
 import librosa.display
 
-gen_path = "output.wav"   # 生成音
-ref_path = "datasets/CVAE6/0038.wav"     # 教師データ
+gen_path = "y1.wav"   # 生成音
+ref_path = "y2.wav"     # 教師データ
 
 # 読み込み
 y_gen, sr_gen = librosa.load(gen_path, sr=None, mono=True)
