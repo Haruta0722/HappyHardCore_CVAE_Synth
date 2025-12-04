@@ -11,6 +11,7 @@ import tensorflow as tf
 import librosa
 import soundfile as sf
 import tensorflow.keras.layers as layers
+
 # -------------------------
 # ハイパーパラメータ（調整可）
 # -------------------------
@@ -24,16 +25,26 @@ LEARNING_RATE = 1e-4
 EPOCHS = 200
 WAVE_L1_WEIGHT = 1.0
 STFT_WEIGHT = 1.2
-MEL_WEIGHT = 3.0
+MEL_WEIGHT = 1.5
 KL_WEIGHT_MAX = 4.0
 ANNEAL_STEPS = 200000    # とてもゆっくり増やす（posterior collapse防止）
 FREE_BITS = 0.5          # free bits（nats） per latent-dimension (大きさは調整)
 STFT_FFTS = [512, 1024, 2048]
 MEL_BINS = 80
+N_FFT = 1024
+HOP = 256
 
 # データ CSV パス
 LABEL_CSV = "datasets/labels.csv"
 BASE_DIR = "."  # CSV内の相対パス基準（必要なら変更）
+
+MEL_MAT_TF = tf.signal.linear_to_mel_weight_matrix(
+    num_mel_bins=MEL_BINS,
+    num_spectrogram_bins=N_FFT // 2 + 1,
+    sample_rate=SR,
+    lower_edge_hertz=0.0,
+    upper_edge_hertz=SR / 2,
+)
 
 # -------------------------
 # ユーティリティ
@@ -49,6 +60,17 @@ def load_wav(path, sr=SR):
 def write_wav(path, y, sr=SR):
     y = np.clip(y, -1.0, 1.0)
     sf.write(path, y, sr)
+
+def wav_to_mel_tf(wav):
+    # wav = [T,1]
+    wav = tf.squeeze(wav, -1)
+
+    stft = tf.signal.stft(wav, frame_length=N_FFT, frame_step=HOP)
+    mag = tf.abs(stft)
+
+    mel = tf.matmul(mag, MEL_MAT_TF)  # [T', n_mels]
+    mel = tf.math.log(mel + 1e-5)
+    return mel
 
 # -------------------------
 # Melフィルタ行列（TFで計算）
@@ -71,16 +93,24 @@ def get_mel_matrix(n_fft, n_mels=MEL_BINS, sr=SR, fmin=0.0, fmax=None):
 # -------------------------
 def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, shuffle=True):
     df = pd.read_csv(csv_path)
-    # 絶対パス化
-    df['input_path'] = df['input_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
-    df['output_path'] = df['output_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
 
-    # 読み込み generator
+    # 絶対パス化
+    df['input_path'] = df['input_path'].apply(
+        lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p
+    )
+    df['output_path'] = df['output_path'].apply(
+        lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p
+    )
+
+    # generator
     def gen():
         for _, row in df.iterrows():
             x = load_wav(row['input_path'])
             y = load_wav(row['output_path'])
-            cond = np.array([row['attack'], row['distortion'], row['thickness'], row['center_tone']], dtype=np.float32)
+            cond = np.array(
+                [row['attack'], row['distortion'], row['thickness'], row['center_tone']],
+                dtype=np.float32
+            )
             yield x, y, cond, np.int32(len(x)), np.int32(len(y))
 
     output_signature = (
@@ -90,15 +120,30 @@ def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, sh
         tf.TensorSpec(shape=(), dtype=tf.int32),
         tf.TensorSpec(shape=(), dtype=tf.int32),
     )
+
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
+
     if shuffle:
         ds = ds.shuffle(buffer_size=256)
-    # expand dims to [T,1]
-    ds = ds.map(lambda x, y, c, lx, ly: (tf.expand_dims(x, -1), tf.expand_dims(y, -1), c, lx, ly))
-    # padded_batch（inputとoutputそれぞれ可変長）
-    ds = ds.padded_batch(batch_size,
-                         padded_shapes=([None,1], [None,1], [4], (), ()),
-                         padding_values=(0.0, 0.0, 0.0, 0, 0))
+
+    # Mel 化
+    ds = ds.map(
+        lambda x, y, c, lx, ly: (
+            wav_to_mel_tf(x),    # [T1, 80]
+            wav_to_mel_tf(y),    # [T2, 80]
+            c,
+            lx,
+            ly
+        ),
+        num_parallel_calls=tf.data.AUTOTUNE
+    )
+
+    ds = ds.padded_batch(
+        batch_size,
+        padded_shapes=([None, MEL_BINS], [None, MEL_BINS], [4], (), ()),
+        padding_values=(0.0, 0.0, 0.0, 0, 0)
+    )
+
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -108,29 +153,6 @@ def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, sh
 # Decoder: z(t) + cond -> upsample convs -> waveform
 # 条件は FiLM 風に各デコーダブロックへ注入する
 # -------------------------
-class FiLM(layers.Layer):
-    def __init__(self, channels, cond_dim=4, name=None):
-        super().__init__(name=name)
-        self.channels = int(channels)
-        self.cond_dim = int(cond_dim)
-        # cond 表現を強化する MLP
-        self.net = tf.keras.Sequential([
-            layers.Dense(128, activation="relu"),
-            layers.Dense(128, activation="relu"),
-            layers.Dense(self.channels * 2,
-                         kernel_initializer="zeros",
-                         bias_initializer="zeros")  # 最初は変化させない
-        ])
-
-    def call(self, inputs):
-        # inputs: [x, cond]
-        x, cond = inputs
-        gb = self.net(cond)                       # [B, 2*C]
-        gamma, beta = tf.split(gb, 2, axis=-1)    # each [B, C]
-        gamma = gamma[:, None, :]                 # [B,1,C]
-        beta  = beta[:, None, :]                  # [B,1,C]
-        return x * (1.0 + gamma) + beta
-
 def build_encoder(latent_dim=LATENT_DIM, channels=ENC_CHANNELS, down_factors=DOWNSAMPLE_FACTORS):
     inp = layers.Input(shape=(None,1), name='enc_input')
     x = inp
@@ -143,81 +165,159 @@ def build_encoder(latent_dim=LATENT_DIM, channels=ENC_CHANNELS, down_factors=DOW
     logvar = layers.Conv1D(latent_dim, kernel_size=3, padding='same', name='enc_logvar')(x)
     return tf.keras.Model(inp, [mean, logvar], name='time_encoder')
 
-def residual_block(x, channels, dilation=1, name=None):
-    """Stable dilated residual block.
-       Conv -> ReLU -> Conv(zeros) -> scale -> add."""
-    
-    # 1: dilated conv
+
+class FiLM(layers.Layer):
+    def __init__(self, channels, cond_dim=4, hidden=128, name=None):
+        super().__init__(name=name)
+        self.channels = int(channels)
+        self.cond_dim = int(cond_dim)
+        self.net = tf.keras.Sequential([
+            layers.Dense(hidden, activation="relu"),
+            layers.Dense(hidden, activation="relu"),
+            layers.Dense(
+                self.channels * 2,
+                kernel_initializer="zeros",
+                bias_initializer="zeros"
+            )
+        ])
+
+    def call(self, inputs):
+        x, cond = inputs
+
+        gb = self.net(cond)  # [B, 2C]
+
+        gamma = gb[:, :self.channels]
+        beta  = gb[:, self.channels:]
+
+        # [B, 1, C] に拡張（Keras backendで安全）
+        gamma = tf.expand_dims(gamma, axis=1)
+        beta  = tf.expand_dims(beta, axis=1)
+
+        return x * (1.0 + gamma) + beta
+
+# ---------- gated residual block (WaveNet style) ----------
+def gated_residual_block(x, channels, dilation=1, name=None,
+                         cond=None, use_film_inside=False, film_hidden=128):
+    """
+    Keras-safe WaveNet-style gated residual block with optional FiLM inside.
+    - x: [B, T, in_ch]
+    - channels: output channels of the block (C)
+    - cond: [B, cond_dim]  (broadcasted over time) or [B, T, cond_dim]
+    - If use_film_inside=True, produce gamma/beta of shape [B,1,C] (or [B,T,C]) and apply to 'a' (the first split)
+    """
+
+    # dilated conv -> produces 2*C channels for gating
     h = layers.Conv1D(
-        filters=channels,
+        filters=channels * 2,
         kernel_size=3,
         dilation_rate=dilation,
         padding="same",
         activation=None,
-        name=f"{name}_dilconv"
+        name=f"{name}_conv"
     )(x)
-    h = layers.Activation("relu", name=f"{name}_dil_relu")(h)
 
-    # 2: final conv with ZERO initialization
-    h = layers.Conv1D(
+    # split into a, b using Lambda (Keras-friendly)
+    a = layers.Lambda(lambda t: t[:, :, :channels], name=f"{name}_split_a")(h)
+    b = layers.Lambda(lambda t: t[:, :, channels:], name=f"{name}_split_b")(h)
+
+    # If conditioning requested, build gamma/beta and apply to 'a'
+    if cond is not None and use_film_inside:
+        # cond may be [B, cond_dim] or [B, T, cond_dim]
+        cond_rank = len(cond.shape)
+        if cond_rank == 2:
+            # cond: [B, cond_dim] -> small MLP -> [B, 2C] -> expand to [B,1,2C]
+            gb = layers.Dense(film_hidden, activation="relu", name=f"{name}_film_dense1")(cond)
+            gb = layers.Dense(channels * 2,
+                              kernel_initializer="zeros",
+                              bias_initializer="zeros",
+                              name=f"{name}_film_dense2")(gb)  # [B, 2C]
+            gb = layers.Lambda(lambda t: tf.expand_dims(t, axis=1), name=f"{name}_film_expand")(gb)  # [B,1,2C]
+        else:
+            # cond: [B, T, cond_dim] -> TimeDistributed projection to [B,T,2C]
+            gb = layers.TimeDistributed(
+                layers.Dense(channels * 2, kernel_initializer="zeros", bias_initializer="zeros"),
+                name=f"{name}_film_td"
+            )(cond)  # [B,T,2C]
+
+        # split gb into gamma, beta (each [B,1,C] or [B,T,C])
+        gamma = layers.Lambda(lambda t: t[..., :channels], name=f"{name}_film_gamma")(gb)
+        beta  = layers.Lambda(lambda t: t[..., channels:], name=f"{name}_film_beta")(gb)
+
+        # gamma + 1 を Lambda で作り、それを a に掛ける
+        gamma_plus_one = layers.Lambda(lambda g: g + 1.0, name=f"{name}_film_gamma_add1")(gamma)
+        a = layers.Multiply(name=f"{name}_film_mul")([a, gamma_plus_one])
+        a = layers.Add(name=f"{name}_film_add")([a, beta])
+
+    # gated activation: tanh(a) * sigmoid(b)
+    a_act = layers.Activation("tanh", name=f"{name}_tanh")(a)
+    b_act = layers.Activation("sigmoid", name=f"{name}_sigmoid")(b)
+    gated = layers.Multiply(name=f"{name}_gated")([a_act, b_act])
+
+    # 1x1 projection (zero-init for stability)
+    proj = layers.Conv1D(
         filters=channels,
         kernel_size=1,
         padding="same",
         activation=None,
-        name=f"{name}_proj",
         kernel_initializer="zeros",
-        bias_initializer="zeros"
-    )(h)
+        bias_initializer="zeros",
+        name=f"{name}_proj"
+    )(gated)
 
-    # 3: residual scaling (0.1 is standard)
-    h = layers.Lambda(lambda t: 0.1 * t, name=f"{name}_scale")(h)
+    # residual scaling
+    proj = layers.Lambda(lambda t: 0.1 * t, name=f"{name}_scale")(proj)
 
-    # 4: skip add (NO ReLU here)
-    out = layers.Add(name=f"{name}_add")([x, h])
+    # ensure input has same channels as proj for add
+    in_ch = tf.keras.backend.int_shape(x)[-1]
+    if in_ch is None or in_ch != channels:
+        x_res = layers.Conv1D(filters=channels, kernel_size=1, padding="same", name=f"{name}_in_proj")(x)
+    else:
+        x_res = x
 
+    out = layers.Add(name=f"{name}_add")([x_res, proj])
     return out
 
-# -------------------------
-# Decoder 全体（差し替え用）
-# -------------------------
+# ---------- improved decoder (差し替え用) ----------
 def build_decoder(
     latent_dim=128,
     cond_dim=4,
-    channels=[256, 128, 64],     # DEC_CHANNELS 相当
-    up_factors=[4, 4, 4],        # 合計 64
-    n_dilated_per_stage=6        # 各アップ段に入れる dilated 層数（変更可）
+    channels=[196, 192, 128],
+    up_factors=[4, 4, 4],
+    n_dilated_per_stage=6,
+    use_film_in_residual=True
 ):
     z_in = layers.Input(shape=(None, latent_dim), name="dec_z_in")
     cond_in = layers.Input(shape=(cond_dim,), name="dec_cond_in")
 
-    # ----- 入力プロジェクション -----
-    x = layers.Conv1D(channels[0], kernel_size=3, padding="same", activation=None, name="dec_proj")(z_in)
-    x = FiLM(channels[0], cond_dim=cond_dim, name="dec_proj_film")([x, cond_in])
-    x = layers.Activation("relu", name="dec_proj_relu")(x)
+    # projection
+    x = layers.Conv1D(channels[0], 3, padding="same", name="dec_proj")(z_in)
+    x = FiLM(channels[0], cond_dim, name="dec_proj_film")([x, cond_in])
+    x = layers.Activation("relu")(x)
 
-    # ----- 各アップサンプルブロック -----
-    for stage_idx, factor in enumerate(up_factors):
-        ch = channels[min(stage_idx, len(channels) - 1)]
-        x = layers.Conv1DTranspose(filters=ch, kernel_size=factor*2, strides=factor, padding="same")(x)
-        x = FiLM(ch, cond_dim=cond_dim, name=f"dec_up_film_s{stage_idx}")([x, cond_in])
-        x = layers.Activation("relu", name=f"dec_up_relu_s{stage_idx}")(x)
+    # stages
+    for s, factor in enumerate(up_factors):
+        ch = channels[min(s, len(channels)-1)]
 
-        # dilated residual stack (各ステージごとに複数)
-        # dilations: 1,2,4,8,... を使う（n_dilated_per_stage 個）
+        x = layers.UpSampling1D(factor, name=f"up{s}_up")(x)
+        x = layers.Conv1D(ch, 7, padding="same", name=f"up{s}_conv")(x)
+
+        x = FiLM(ch, cond_dim, name=f"up{s}_film")([x, cond_in])
+        x = layers.Activation("relu")(x)
+
+        # dilated stack
         for i in range(n_dilated_per_stage):
-            d = 2 ** (i % 6)  # 1,2,4,8,16,32 を繰り返す（必要なら変える）
-            x = residual_block(x, channels=ch, dilation=d, name=f"dec_stage{stage_idx}_res{i}")
+            d = 2**i
+            x = gated_residual_block(
+                x, channels=ch, dilation=d,
+                name=f"up{s}_grb{i}",
+                cond=cond_in,
+                use_film_inside=use_film_in_residual
+            )
 
-        # stag-end にもう一回 FiLM して安定化
-        x = FiLM(ch, cond_dim=cond_dim, name=f"dec_stage{stage_idx}_postfilm")([x, cond_in])
-        x = layers.Activation("relu", name=f"dec_stage{stage_idx}_post_relu")(x)
+    out = layers.Conv1D(1, 7, padding="same", activation="tanh",
+                        name="dec_out")(x)
 
-    # ----- 出力プロジェクション -----
-    x = layers.Conv1D(64, kernel_size=7, padding="same", activation="relu", name="dec_final_conv1")(x)
-    out = layers.Conv1D(1, kernel_size=7, padding="same", activation="tanh", name="dec_final_out")(x)
-    # NaN/Inf safe guard を Lambda で包む
-
-    return tf.keras.Model([z_in, cond_in], out, name="time_decoder_improved")
+    return tf.keras.Model([z_in, cond_in], out, name="decoder")
 # -------------------------
 # Reparameterize（time-distributed）
 # -------------------------
@@ -237,40 +337,56 @@ import tensorflow as tf
 # -----------------------------------
 # 安全な complex STFT L1
 # -----------------------------------
-def stft_complex_l1(y, y_hat, fft_size, hop_size, eps=1e-7):
-    S = tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+def spectral_convergence(y, y_hat, fft_size, hop_size, eps=1e-7):
+    # S, S_hat: shape [B, frames, freq]
+    S = tf.stop_gradient(tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
     S_hat = tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
 
-    # magnitude only
+    S_mag = tf.maximum(tf.abs(S), eps)
+    S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
+
+    diff = S_mag - S_hat_mag  # [B, frames, freq]
+
+    # per-example Frobenius norm: sqrt(sum(square(x), axes=(1,2)))
+    num_per_example = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=[1, 2]))
+    den_per_example = tf.sqrt(tf.reduce_sum(tf.square(S_mag), axis=[1, 2]))
+
+    sc_per_example = num_per_example / (den_per_example + eps)  # [B]
+    return tf.reduce_mean(sc_per_example)  # scalar (平均)
+
+
+def magnitude_l1(y, y_hat, fft_size, hop_size, eps=1e-7):
+    S = tf.stop_gradient(tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
+    S_hat = tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+
     S_mag = tf.maximum(tf.abs(S), eps)
     S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
 
     return tf.reduce_mean(tf.abs(S_mag - S_hat_mag))
 
-
-def log_mag_l1(y, y_hat, fft_size, hop_size, eps=1e-7):
-    S = tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
+def log_mag_l1(y, y_hat, fft_size, hop_size, eps=1e-7): 
+    S = tf.stop_gradient(tf.signal.stft(y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size))
     S_hat = tf.signal.stft(y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size)
-
     S_mag = tf.maximum(tf.abs(S), eps)
     S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
-
     return tf.reduce_mean(tf.abs(tf.math.log(S_mag) - tf.math.log(S_hat_mag)))
 
 
+
 def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS, eps=1e-7):
-    S = tf.signal.stft(y, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+    S = tf.stop_gradient(tf.signal.stft(y, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
     S_hat = tf.signal.stft(y_hat, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
 
     S_mag = tf.maximum(tf.abs(S), eps)
     S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
 
-    mel_mat = tf.cast(get_mel_matrix(n_fft, n_mels=n_mels), S_mag.dtype)
+    # mel 行列は固定なので勾配を stop！
+    mel_mat = tf.stop_gradient(tf.cast(get_mel_matrix(n_fft, n_mels=n_mels), S_mag.dtype))
 
-    mel = tf.matmul(S_mag, mel_mat)
+    mel     = tf.matmul(S_mag, mel_mat)
     mel_hat = tf.matmul(S_hat_mag, mel_mat)
 
-    mel = tf.maximum(mel, eps)
+    mel     = tf.maximum(mel, eps)
     mel_hat = tf.maximum(mel_hat, eps)
 
     return tf.reduce_mean(tf.abs(tf.math.log(mel) - tf.math.log(mel_hat)))
@@ -374,7 +490,30 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
             stft_terms = []
             for n_fft in STFT_FFTS:
                 hop = max(64, n_fft // 4)
-                stft_terms.append(stft_complex_l1(y_s, yhat_s, n_fft, hop) + log_mag_l1(y_s, yhat_s, n_fft, hop))
+
+                # --- compute STFT once per side and reuse ---
+                S_y = tf.stop_gradient(tf.signal.stft(y_s, frame_length=n_fft, frame_step=hop, fft_length=n_fft))
+                S_hat = tf.signal.stft(yhat_s, frame_length=n_fft, frame_step=hop, fft_length=n_fft)
+
+                S_y_mag = tf.maximum(tf.abs(S_y), 1e-7)
+                S_hat_mag = tf.maximum(tf.abs(S_hat), 1e-7)
+
+                # spectral convergence (per-example)
+                diff = S_y_mag - S_hat_mag  # [B, frames, freq]
+                num_per_example = tf.sqrt(tf.reduce_sum(tf.square(diff), axis=[1,2]))
+                den_per_example = tf.sqrt(tf.reduce_sum(tf.square(S_y_mag), axis=[1,2]))
+                sc_per_example = num_per_example / (den_per_example + 1e-7)
+                sc = tf.reduce_mean(sc_per_example)
+
+                # magnitude L1
+                mag = tf.reduce_mean(tf.abs(S_y_mag - S_hat_mag))
+
+                # log magnitude L1
+                logm = tf.reduce_mean(tf.abs(tf.math.log(S_y_mag) - tf.math.log(S_hat_mag)))
+
+                stft_terms.append(sc + mag + logm)
+
+
             stft_loss = tf.add_n(stft_terms) / float(len(stft_terms))
 
             # mel loss (single resolution)
