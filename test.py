@@ -1,16 +1,16 @@
+import os
+os.environ["OMP_NUM_THREADS"]="1"
+os.environ["OPENBLAS_NUM_THREADS"]="1"
+os.environ["MKL_NUM_THREADS"]="1"
+os.environ["NUMEXPR_NUM_THREADS"]="1"
+os.environ["TF_ENABLE_ONEDNN_OPTS"]="0"
+os.environ["KMP_INIT_AT_FORK"]="FALSE"
+
+import multiprocessing as mp
+mp.set_start_method("spawn", force=True)
+
+import numpy as np
+import librosa
+import soundfile as sf
 import tensorflow as tf
-from train import build_decoder
-
-latent_dim = 128
-cond_dim = 4
-
-# z は (B, T, latent_dim)
-z = tf.random.normal((1, 10, latent_dim))
-
-# c は (B, cond_dim) で時間次元なし！
-c = tf.zeros((1, cond_dim))
-
-decoder = build_decoder()
-
-test = decoder([z, c])
-print(tf.reduce_min(test), tf.reduce_max(test))
+print("imports ok, TF version:", tf.__version__)
