@@ -1,59 +1,79 @@
-# model_infer_dynamic_build.py
 import tensorflow as tf
 import numpy as np
 import librosa
+
+# 学習時と同じものを import（超重要）
 from train import (
-    build_encoder, build_decoder, WaveTimeConditionalCVAE, write_wav
+    build_encoder,
+    build_decoder,
+    WaveTimeConditionalCVAE,
+    LATENT_DIM,
+    ENC_CHANNELS,
+    DEC_CHANNELS,
+    DOWNSAMPLE_FACTORS,
+    write_wav
 )
 
-def infer (input_wav_name , file_name: str,cond):
+def infer(input_wav_name, out_name, cond):
 
     # ====== 音声読み込み ======
-    filename =  input_wav_name
-    wav, sr = librosa.load(filename, sr=32000)  # SRは学習時と同じに
+    wav, sr = librosa.load(input_wav_name, sr=32000)
     wav = np.expand_dims(wav, axis=[0, -1])  # [1, T, 1]
     T = wav.shape[1]
-    print(f"✅ 読み込み完了: {filename} (長さ: {T} samples)")
+    print(f"読み込み完了: {input_wav_name} (len={T})")
 
-    #====== モデル構築 ======
-    encoder = build_encoder()
-    decoder = build_decoder()
-    model = WaveTimeConditionalCVAE(encoder, decoder)
+    # ====== モデル構築（学習時のコードと完全に同じ） ======
+    encoder = build_encoder(
+        latent_dim=LATENT_DIM,
+        channels=ENC_CHANNELS,
+        down_factors=DOWNSAMPLE_FACTORS
+    )
 
-    # ⚡ 実データに基づいてshape確定（これがビルド相当）
+    decoder = build_decoder(
+        latent_dim=LATENT_DIM,
+        channels=DEC_CHANNELS,
+        up_factors=DOWNSAMPLE_FACTORS[::-1],
+        cond_dim=4
+    )
+
+    model = WaveTimeConditionalCVAE(
+        encoder, decoder,
+        latent_dim=LATENT_DIM,
+        kl_anneal_steps=1,     # 推論時は関係ない
+        kl_weight_max=1.0,     # 推論時は関係ない
+        free_bits=0.0          # 推論時は関係ない
+    )
+
+    # ====== モデル build（学習時と同じ呼び方で）=====
     x_in = tf.constant(wav, dtype=tf.float32)
-    y_in = tf.zeros_like(x_in)  # ダミー出力（学習時の入力形に合わせる）
+    y_dummy = tf.zeros_like(x_in)
     lx = tf.constant([T], dtype=tf.int32)
     ly = tf.constant([T], dtype=tf.int32)
-    _ = model((x_in, y_in, cond, lx, ly), training=False)
-    print("✅ モデルshape確定（実データベース）")
+
+    _ = model([x_in, cond, y_dummy])  # build only
 
     # ====== 重みロード ======
-    model.load_weights("checkpoints_cvae/cvae_164.weights.h5")
-    print("✅ 重みロード完了")
+    ckpt = "checkpoints_cvae/cvae_044.weights.h5"
+    print(f"重みをロード: {ckpt}")
+    model.load_weights(ckpt)
+    print("重みロード完了")
 
-    # ====== 潜在ベクトル推論 ======
-    mean, logvar = model.encoder(x_in, training=False)
-    eps = tf.random.normal(shape=tf.shape(mean))
-    z = mean + tf.exp(0.5 * logvar) * eps * 0.1
+    # ====== 推論（Encoder → sampling → Decoder） ======
+    mu, logvar = model.encoder(x_in, training=False)
+    std = tf.exp(0.5 * logvar)
+    eps = tf.random.normal(shape=std.shape)
+    z = mu + eps * std  # 再パラメータ化トリっク
+    y_pred = model.decoder([z, cond], training=False)
 
-    # ====== 再構成 ======
-    y_1 = model.decoder([z, cond], training=False)
-    y_1 = tf.squeeze(y_1).numpy()
-    write_wav(file_name, y_1)
-    print("保存完了！")
+    y_pred = y_pred.numpy()[0, :, 0]
 
-    return y_1
+    # ====== 保存 ======
+    write_wav(out_name, y_pred, sr=32000)
+    print(f"生成完了 → {out_name}")
 
-def conpare_spec(y_1, y_2):
-    S_1 = np.abs(librosa.stft(y_1, n_fft=1024, hop_length=256))
-    S_2 = np.abs(librosa.stft(y_2, n_fft=1024, hop_length=256))
-    print("spec L1:", np.mean(np.abs(np.log(S_1+1e-7)-np.log(S_2+1e-7))))
+    return y_pred
 
 
-filename = "datasets/input_data/0010.wav"
-
-y_1 = infer(filename, "y1.wav",cond=tf.constant([[0.0, 0.0, 0.0, 0.0]]) )  # condは適宜変更
-y_2 = infer(filename,"y2.wav", cond=tf.constant([[0.0, 0.0, 0.0,  1.0]]))  # condは適宜変更
-
-conpare_spec(y_1, y_2)
+if __name__ == "__main__":
+    cond = tf.constant([[0.0, 0.0, 0.0, 0.0]], dtype=tf.float32)
+    infer("datasets/input_data/0013.wav", "y1.wav", cond)
