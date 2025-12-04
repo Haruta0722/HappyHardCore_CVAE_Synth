@@ -31,20 +31,10 @@ ANNEAL_STEPS = 200000    # とてもゆっくり増やす（posterior collapse�
 FREE_BITS = 0.5          # free bits（nats） per latent-dimension (大きさは調整)
 STFT_FFTS = [512, 1024, 2048]
 MEL_BINS = 80
-N_FFT = 1024
-HOP = 256
 
 # データ CSV パス
 LABEL_CSV = "datasets/labels.csv"
 BASE_DIR = "."  # CSV内の相対パス基準（必要なら変更）
-
-MEL_MAT_TF = tf.signal.linear_to_mel_weight_matrix(
-    num_mel_bins=MEL_BINS,
-    num_spectrogram_bins=N_FFT // 2 + 1,
-    sample_rate=SR,
-    lower_edge_hertz=0.0,
-    upper_edge_hertz=SR / 2,
-)
 
 # -------------------------
 # ユーティリティ
@@ -61,16 +51,7 @@ def write_wav(path, y, sr=SR):
     y = np.clip(y, -1.0, 1.0)
     sf.write(path, y, sr)
 
-def wav_to_mel_tf(wav):
-    # wav = [T,1]
-    wav = tf.squeeze(wav, -1)
-
-    stft = tf.signal.stft(wav, frame_length=N_FFT, frame_step=HOP)
-    mag = tf.abs(stft)
-
-    mel = tf.matmul(mag, MEL_MAT_TF)  # [T', n_mels]
-    mel = tf.math.log(mel + 1e-5)
-    return mel
+    
 
 # -------------------------
 # Melフィルタ行列（TFで計算）
@@ -93,24 +74,16 @@ def get_mel_matrix(n_fft, n_mels=MEL_BINS, sr=SR, fmin=0.0, fmax=None):
 # -------------------------
 def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, shuffle=True):
     df = pd.read_csv(csv_path)
-
     # 絶対パス化
-    df['input_path'] = df['input_path'].apply(
-        lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p
-    )
-    df['output_path'] = df['output_path'].apply(
-        lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p
-    )
+    df['input_path'] = df['input_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
+    df['output_path'] = df['output_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
 
-    # generator
+    # 読み込み generator
     def gen():
         for _, row in df.iterrows():
             x = load_wav(row['input_path'])
             y = load_wav(row['output_path'])
-            cond = np.array(
-                [row['attack'], row['distortion'], row['thickness'], row['center_tone']],
-                dtype=np.float32
-            )
+            cond = np.array([row['attack'], row['distortion'], row['thickness'], row['center_tone']], dtype=np.float32)
             yield x, y, cond, np.int32(len(x)), np.int32(len(y))
 
     output_signature = (
@@ -120,30 +93,15 @@ def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, sh
         tf.TensorSpec(shape=(), dtype=tf.int32),
         tf.TensorSpec(shape=(), dtype=tf.int32),
     )
-
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
-
     if shuffle:
         ds = ds.shuffle(buffer_size=256)
-
-    # Mel 化
-    ds = ds.map(
-        lambda x, y, c, lx, ly: (
-            wav_to_mel_tf(x),    # [T1, 80]
-            wav_to_mel_tf(y),    # [T2, 80]
-            c,
-            lx,
-            ly
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
-
-    ds = ds.padded_batch(
-        batch_size,
-        padded_shapes=([None, MEL_BINS], [None, MEL_BINS], [4], (), ()),
-        padding_values=(0.0, 0.0, 0.0, 0, 0)
-    )
-
+    # expand dims to [T,1]
+    ds = ds.map(lambda x, y, c, lx, ly: (tf.expand_dims(x, -1), tf.expand_dims(y, -1), c, lx, ly))
+    # padded_batch（inputとoutputそれぞれ可変長）
+    ds = ds.padded_batch(batch_size,
+                         padded_shapes=([None,1], [None,1], [4], (), ()),
+                         padding_values=(0.0, 0.0, 0.0, 0, 0))
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
