@@ -7,4 +7,5 @@
 !hhc/app/
 *.DS_Store
 *.code-workspace
+memo
 /checkpoints_cvae/
