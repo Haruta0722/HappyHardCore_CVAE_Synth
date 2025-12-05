@@ -14,13 +14,13 @@ import json
 # Hyperparams (tuneable)
 # -----------------------
 EPOCH =200
-SR = 22050
+SR = 32000
 N_FFT = 1024
 HOP = 256
 N_MELS = 80
 BATCH_SIZE = 4           
 LATENT_DIM = 64
-COND_DIM = 16
+COND_DIM = 4
 
 STFT_FFTS = [512, 1024]   
 MEL_BINS = N_MELS
@@ -39,6 +39,7 @@ BAND_HIGH_HZ = 16000.0
 MEL_BINS = 80
 N_FFT = 1024
 HOP = 256
+LOG_EPS = float(np.log(1e-6))  
 
 # データ CSV パス
 LABEL_CSV = "datasets/labels.csv"
@@ -83,45 +84,75 @@ def write_wav(path, y, sr=SR):
 
 
 
-def wav_to_mel_tf(wav):
-   
-    wav = tf.squeeze(wav, -1)
+# --- 前提定義（既存の定数）---
+# SR, N_FFT, HOP, N_MELS は既に定義済みとする
 
-    stft = tf.signal.stft(wav, frame_length=N_FFT, frame_step=HOP)
-    mag = tf.abs(stft)
+# numpy 側で mel を作る関数（py_function 用）
+def wav_to_mel_py(wav_np):
+    # wav_np: np.ndarray, dtype float32, shape (T,) or (T,1)
+    if wav_np is None:
+        return np.zeros((0, N_MELS), dtype=np.float32)
 
-    mel = tf.matmul(mag, MEL_MAT) 
-    mel = tf.math.log(mel + 1e-5)
+    wav_np = np.asarray(wav_np, dtype=np.float32).squeeze()
+    if wav_np.ndim == 0:
+        # スカラーになってしまっているなら空スペクトログラムを返す（保険）
+        return np.zeros((0, N_MELS), dtype=np.float32)
+
+    # librosa.stft: shape (freq_bins, frames)
+    S = librosa.stft(wav_np, n_fft=N_FFT, hop_length=HOP, win_length=N_FFT, center=True)
+    mag = np.abs(S).T  # -> (frames, freq_bins)
+
+    # mel フィルタ行列（numpy版を事前に作っておくと速い）
+    # MEL_MAT_np must be shape (freq_bins, N_MELS)
+    mel = np.matmul(mag, MEL_MAT_np)  # (frames, n_mels)
+    # log scaling
+    mel = np.log(mel + 1e-6).astype(np.float32)
+
+    mel[np.isnan(mel)] = 0.0
+    mel[np.isinf(mel)] = 0.0
     return mel
 
+# map 関数で py_function を使うラッパー
+def map_to_mel(x_wav, y_wav, cond, y_sample_len):
+    # x_wav, y_wav are tf.Tensor 1-D float32 (from from_generator)
+    # Use tf.py_function to call your numpy-based wav_to_mel_py
+    x_mel = tf.py_function(func=wav_to_mel_py, inp=[x_wav], Tout=tf.float32)
+    y_mel = tf.py_function(func=wav_to_mel_py, inp=[y_wav], Tout=tf.float32)
+
+    # py_function removes shape info -> set shapes explicitly
+    x_mel.set_shape([None, N_MELS])   # (frames_x, n_mels)
+    y_mel.set_shape([None, N_MELS])   # (frames_y, n_mels)
+
+    # compute mel frame count for target (as a plain tf.int32 scalar / tensor)
+    y_mel_frames = tf.cast(tf.shape(y_mel)[0], tf.int32)
+
+    # keep condition as float32
+    cond = tf.cast(cond, tf.float32)
+
+    # Return order that train_step expects: x_mel, y_waveform, cond, y_mel_frames
+    # Note: keep y_wav (raw waveform) for STFT loss. We don't return y_mel here as it's not needed in train_step.
+    return x_mel, y_wav, cond, y_mel_frames
+
+
+# 改訂版 make_dataset_from_csv（抜粋）
 def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, shuffle=True):
     df = pd.read_csv(csv_path)
 
-    # 絶対パス化
-    df['input_path'] = df['input_path'].apply(
-        lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p
-    )
-    df['output_path'] = df['output_path'].apply(
-        lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p
-    )
+    df['input_path']  = df['input_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
+    df['output_path'] = df['output_path'].apply(lambda p: os.path.join(base_dir, p) if not os.path.isabs(p) else p)
 
-    # generator
     def gen():
         for _, row in df.iterrows():
             x = load_wav(row['input_path'])
             y = load_wav(row['output_path'])
-            cond = np.array(
-                [row['attack'], row['distortion'], row['thickness'], row['center_tone']],
-                dtype=np.float32
-            )
-            yield x, y, cond, np.int32(len(x)), np.int32(len(y))
+            cond = np.array([row['attack'], row['distortion'], row['thickness'], row['center_tone']], dtype=np.float32)
+            yield x, y, cond, np.int32(len(y))
 
     output_signature = (
-        tf.TensorSpec(shape=(None,), dtype=tf.float32),
-        tf.TensorSpec(shape=(None,), dtype=tf.float32),
-        tf.TensorSpec(shape=(4,), dtype=tf.float32),
-        tf.TensorSpec(shape=(), dtype=tf.int32),
-        tf.TensorSpec(shape=(), dtype=tf.int32),
+        tf.TensorSpec(shape=(None,), dtype=tf.float32),  # x wav
+        tf.TensorSpec(shape=(None,), dtype=tf.float32),  # y wav
+        tf.TensorSpec(shape=(4,), dtype=tf.float32),     # cond
+        tf.TensorSpec(shape=(), dtype=tf.int32),         # y_length
     )
 
     ds = tf.data.Dataset.from_generator(gen, output_signature=output_signature)
@@ -129,27 +160,30 @@ def make_dataset_from_csv(csv_path, base_dir=BASE_DIR, batch_size=BATCH_SIZE, sh
     if shuffle:
         ds = ds.shuffle(buffer_size=256)
 
-    # Mel 化
-    ds = ds.map(
-        lambda x, y, c, lx, ly: (
-            wav_to_mel_tf(x),   
-            wav_to_mel_tf(y),   
-            c,
-            lx,
-            ly
-        ),
-        num_parallel_calls=tf.data.AUTOTUNE
-    )
+    # ① wav → mel
+    ds = ds.map(map_to_mel, num_parallel_calls=tf.data.AUTOTUNE)
 
+    # ③ padding
     ds = ds.padded_batch(
         batch_size,
-        padded_shapes=([None, MEL_BINS], [None, MEL_BINS], [4], (), ()),
-        padding_values=(0.0, 0.0, 0.0, 0, 0)
+        padded_shapes=(
+            [None, N_MELS],  # x_mel
+            [None],          # y wav
+            [4],             # cond
+            ()             # y_len
+        ),
+        padding_values=(
+            tf.constant(LOG_EPS, dtype=tf.float32),  # mel の padding（重要）
+            tf.constant(0.0, dtype=tf.float32),      # y waveform の padding
+            tf.constant(0.0, dtype=tf.float32),      # cond
+            tf.constant(0, dtype=tf.int32)           # length
     )
+    )
+
+    ds = ds.repeat() 
 
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
-
 
 
 
@@ -198,7 +232,7 @@ def build_encoder(latent_dim=LATENT_DIM, chs=[128, 128, 128], kernel=3):
     x = inp
     for i, c in enumerate(chs):
         x = layers.Conv1D(c, kernel_size=kernel, padding="same", name=f"enc_conv_{i}")(x)
-        x = layers.BatchNormalization(name=f"enc_bn_{i}")(x)
+        x = layers.LayerNormalization()(x)
         x = layers.Activation("relu")(x)
 
     # optionally a few dilated blocks (keeps time)
@@ -329,19 +363,18 @@ def magnitude_l1_from_mag(S_mag, S_hat_mag):
 def log_mag_l1_from_mag(S_mag, S_hat_mag, eps=1e-7):
     return tf.reduce_mean(tf.abs(tf.math.log(S_mag + eps) - tf.math.log(S_hat_mag + eps)))
 
-def mel_l1_from_mel(mel, mel_hat, eps=1e-7):
-    # mel & mel_hat shape: [B, T, n_mels]
-    return tf.reduce_mean(tf.abs(tf.math.log(mel + eps) - tf.math.log(mel_hat + eps)))
+def mel_l1_from_mel_log(mel_log, mel_hat_log):
+    # both are in log-domain already: [B, T, n_mels]
+    # mask 算出は呼び出し側で行う（既にしているなら不要）
+    return tf.reduce_mean(tf.abs(mel_log - mel_hat_log))
 
 
-def band_out_penalty_from_mel(mel_hat, sr=SR, n_fft=N_FFT):
-    
-   
+def band_out_penalty_from_mel_linear(mel_hat_linear, sr=SR):
+    # mel_hat_linear: linear mel magnitudes [B, T, n_mels]
     mel_f = librosa.mel_frequencies(n_mels=N_MELS, fmin=0.0, fmax=sr/2.0)
-   
-    mask = np.logical_or(mel_f < BAND_LOW_HZ, mel_f > BAND_HIGH_HZ).astype(np.float32)  
-    mask_tf = tf.constant(mask[None, None, :])  
-    penalty = tf.reduce_mean(tf.abs(mel_hat * mask_tf))
+    mask = np.logical_or(mel_f < BAND_LOW_HZ, mel_f > BAND_HIGH_HZ).astype(np.float32)
+    mask_tf = tf.constant(mask[None, None, :])
+    penalty = tf.reduce_mean(tf.abs(mel_hat_linear * mask_tf))
     return penalty
 
 
@@ -376,8 +409,7 @@ class MelTimeCVAE(tf.keras.Model):
     def __init__(self, encoder, decoder, latent_dim=LATENT_DIM,
                  kl_anneal_steps=KL_ANNEAL_STEPS, kl_weight_max=KL_WEIGHT_MAX,
                  free_bits=FREE_BITS,
-                 stft_w=W_STFT, mel_w=W_MEL, band_w=W_BAND,
-                 steps_per_epoch=100):
+                 stft_w=W_STFT, mel_w=W_MEL, band_w=W_BAND):
         super().__init__()
         self.encoder = encoder
         self.decoder = decoder
@@ -411,45 +443,68 @@ class MelTimeCVAE(tf.keras.Model):
         return s * self.kl_weight_max
 
     def train_step(self, data):
-        """
-        data is a tuple: (waveform y [B, T_samps], mel [B, T_frames, n_mels], cond [B, cond_dim], len_frames)
-        We assume the mel was computed with same n_fft/hop as our constants.
-        """
-        y, mel, cond, len_frames = data  
+        
+        x_mel,y, cond, len_frames = data  
+        if len_frames is not None:
+            max_frames = tf.shape(x_mel)[1]
+            mask = tf.cast(tf.sequence_mask(len_frames, maxlen=max_frames), tf.float32)
+            mask = tf.expand_dims(mask, -1)   # [B, T, 1]
+            x_mel_masked = x_mel * mask
+        else:
+            x_mel_masked = x_mel
+            mask = None
+        
 
         with tf.GradientTape() as tape:
-            mean, logvar = self.encoder(mel, training=True)  
-            z = self.reparam(mean, logvar, training=True)   
+
+            # マスク適用後の x_mel, mel_hat
+            # tf.print("x_mel_masked min/max:", tf.reduce_min(x_mel_masked), tf.reduce_max(x_mel_masked))
+            # tf.debugging.check_numerics(x_mel_masked, "x_mel")
+
+            mean, logvar = self.encoder(x_mel_masked, training=True)  
+            # tf.print("mean logvar stats:", tf.reduce_min(mean), tf.reduce_max(mean), tf.reduce_min(logvar), tf.reduce_max(logvar))
+            # tf.debugging.check_numerics(mean, "mean")
+            # tf.debugging.check_numerics(logvar, "logvar")
+            z = self.reparam(mean, logvar, training=True)
+
             mel_hat = self.decoder([z, cond], training=True)
-
-            
             if len_frames is not None:
-                max_frames = tf.shape(mel)[1]
-                mask = tf.cast(tf.expand_dims(tf.sequence_mask(len_frames, maxlen=max_frames), -1), tf.float32)
-                mel = mel * mask
+                max_frames = tf.shape(x_mel)[1]
+                mask = tf.cast(tf.sequence_mask(len_frames, maxlen=max_frames), tf.float32)
+                mask = tf.expand_dims(mask, -1)   # [B, T, 1]
                 mel_hat = mel_hat * mask
+            else:
+                pass
+            # tf.print("mel_hat min/max:", tf.reduce_min(mel_hat), tf.reduce_max(mel_hat))
+            # tf.debugging.check_numerics(mel_hat, "mel_hat")
 
             
-            mel_loss = mel_l1_from_mel(mel, mel_hat)
 
             
-            
-            S_hat_mag = mel_to_linear_mag(mel_hat) 
-            S_mag_target = waveform_to_linear_mag(y, n_fft=N_FFT, hop=HOP) 
+           # 再構成損失（log-domain 同士の L1）
+            mel_loss = mel_l1_from_mel_log(x_mel_masked, mel_hat)
 
-           
+            # mel_hat を linear mel に戻す（数値安定化）
+            eps_small = 1e-6
+            mel_hat_linear = tf.exp(mel_hat)  # since x_mel = log(linear + eps) originally
+            mel_hat_linear = tf.maximum(mel_hat_linear, 1e-7)
+
+            # それを線形スペクトルに戻す（既存関数を利用）
+            S_hat_mag = mel_to_linear_mag(mel_hat_linear)   # expects linear mel -> uses MEL_PINV
+            S_mag_target = waveform_to_linear_mag(y, n_fft=N_FFT, hop=HOP)
+
+            # フレーム数合わせて STFT 損失
             min_frames = tf.minimum(tf.shape(S_hat_mag)[1], tf.shape(S_mag_target)[1])
             S_hat_c = S_hat_mag[:, :min_frames, :]
             S_tar_c = S_mag_target[:, :min_frames, :]
 
-            
             sc = spectral_convergence_from_mag(S_tar_c, S_hat_c)
             mag = magnitude_l1_from_mag(S_tar_c, S_hat_c)
             logm = log_mag_l1_from_mag(S_tar_c, S_hat_c)
             stft_loss = sc + mag + logm
 
             
-            band_loss = band_out_penalty_from_mel(mel_hat)
+            band_loss = band_out_penalty_from_mel_linear(mel_hat_linear)
 
             
             kl_per = -0.5 * (1.0 + logvar - tf.square(mean) - tf.exp(logvar))
@@ -477,15 +532,35 @@ class MelTimeCVAE(tf.keras.Model):
         self.mean_logvar_tracker.update_state(tf.reduce_mean(logvar))
 
         return {
-            "loss": self.loss_tracker.result().numpy(),
-            "mel_loss": self.recon_mel_tracker.result().numpy(),
-            "stft_loss": self.recon_stft_tracker.result().numpy(),
-            "band_loss": self.band_tracker.result().numpy(),
-            "kl": self.kl_tracker.result().numpy(),
-            "kl_w": float(kl_w),
-            "mean_logvar": self.mean_logvar_tracker.result().numpy(),
-            "step": int(self.total_steps.numpy())
+            "loss": self.loss_tracker.result(),
+            "mel_loss": self.recon_mel_tracker.result(),
+            "stft_loss": self.recon_stft_tracker.result(),
+            "band_loss": self.band_tracker.result(),
+            "kl": self.kl_tracker.result(),
+            "kl_w": kl_w,
+            "mean_logvar": self.mean_logvar_tracker.result(),
+            "step": self.total_steps
         }
+    
+    
+
+    def call(self, inputs, training=False):
+        # inputs は [mel, cond] のような形式で受け取る
+        mel, cond = inputs
+
+        print("mel:", mel.shape)
+        print("cond:", cond.shape)
+        # 1) エンコード
+        z_mean, z_logvar = self.encoder(mel, training=training)
+
+        # 2) サンプリング
+        z = self.reparam(z_mean, z_logvar)
+
+        # 3) デコード
+        recon = self.decoder([z, cond], training=training)
+
+        # 4) 必要なら KL も返す
+        return recon, z_mean, z_logvar
 
 def make_model():
     enc = build_encoder(latent_dim=LATENT_DIM, chs=[128,128,128])
@@ -510,18 +585,25 @@ def load_state():
 
 
 def main():
+
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
+
 
     # ---------------------------
     # データセット
     # ---------------------------
     ds = make_dataset_from_csv(LABEL_CSV, base_dir=".", batch_size=4, shuffle=True)
-
     # ---------------------------
     # モデル
     # ---------------------------
     model = make_model()
     model.compile(optimizer=tf.keras.optimizers.Adam(1e-4))
+
+    sample_batch = next(iter(ds.take(1)))
+
+    x_mel_s, y_s, cond_s, frames_s = sample_batch
+        
+    _ = model([x_mel_s, cond_s])   # build the model (encoder->decoder) once
 
     # ---------------------------
     # 途中再開
@@ -576,6 +658,7 @@ def main():
         ds,
         epochs=EPOCH,
         initial_epoch=initial_epoch,
+        steps_per_epoch=243,
         callbacks=[epoch_ckpt_cb, last_ckpt_cb, state_cb, lr_cb]
     )
 
