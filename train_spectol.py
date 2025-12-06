@@ -14,10 +14,10 @@ import json
 # Hyperparams (tuneable)
 # -----------------------
 EPOCH = 200
-SR = 32000
-N_FFT = 1024
-HOP = 256
-N_MELS = 80
+SR = 44100
+N_FFT = 2048
+HOP = 512
+N_MELS = 128
 BATCH_SIZE = 4
 LATENT_DIM = 64
 COND_DIM = 4
@@ -34,11 +34,8 @@ W_STFT = 1.0
 W_BAND = 1.0
 
 BAND_LOW_HZ = 150.0
-BAND_HIGH_HZ = 16000.0
+BAND_HIGH_HZ = 22050.0
 
-MEL_BINS = 80
-N_FFT = 1024
-HOP = 256
 LOG_EPS = float(np.log(1e-6))
 
 # データ CSV パス
