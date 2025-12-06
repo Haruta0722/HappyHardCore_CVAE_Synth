@@ -1,23 +1,22 @@
 from train_spectol import (
     build_encoder,
     build_decoder,
-   MelTimeCVAE,
+    MelTimeCVAE,
     LATENT_DIM,
     COND_DIM,
     N_FFT,
     HOP,
     N_MELS,
-    SR 
+    SR,
 )
 import tensorflow as tf
 import librosa
 from griffin_lim import mel_to_wave_via_griffinlim
 import numpy as np
-
-import numpy as np
-import librosa
+import soundfile as sf
 
 # 前提：SR, N_FFT, HOP, MEL_PINV_np が既に定義済みであること
+
 
 def wav_to_mel_py(wav_np):
     # wav_np: np.ndarray, dtype float32, shape (T,) or (T,1)
@@ -30,9 +29,10 @@ def wav_to_mel_py(wav_np):
         return np.zeros((0, N_MELS), dtype=np.float32)
 
     # librosa.stft: shape (freq_bins, frames)
-    S = librosa.stft(wav_np, n_fft=N_FFT, hop_length=HOP, win_length=N_FFT, center=True)
+    S = librosa.stft(
+        wav_np, n_fft=N_FFT, hop_length=HOP, win_length=N_FFT, center=True
+    )
     mag = np.abs(S).T  # -> (frames, freq_bins)
-
 
     # MEL_MAT_np must be shape (freq_bins, N_MELS)
     mel = np.matmul(mag, N_MELS)  # (frames, n_mels)
@@ -42,6 +42,7 @@ def wav_to_mel_py(wav_np):
     mel[np.isnan(mel)] = 0.0
     mel[np.isinf(mel)] = 0.0
     return mel
+
 
 def mel_log_to_linear_mag(mel_log, mel_pinv_np=80):
     """
@@ -74,6 +75,7 @@ def mel_log_to_linear_mag(mel_log, mel_pinv_np=80):
     else:
         raise ValueError("mel_log must be shape (T,n_mels) or (B,T,n_mels)")
 
+
 def infer(input_wav_name, out_name, cond):
 
     # ====== 音声読み込み ======
@@ -83,15 +85,18 @@ def infer(input_wav_name, out_name, cond):
     print(f"読み込み完了: {input_wav_name} (len={T})")
 
     # ====== モデル構築（学習時のコードと完全に同じ） ======
-    enc = build_encoder(latent_dim=LATENT_DIM, chs=[128,128,128])
-    dec = build_decoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM, channels=[128,128,64],
-                        n_dilated_per_stage=3, use_film_in_residual=True)
+    enc = build_encoder(latent_dim=LATENT_DIM, chs=[128, 128, 128])
+    dec = build_decoder(
+        latent_dim=LATENT_DIM,
+        cond_dim=COND_DIM,
+        channels=[128, 128, 64],
+        n_dilated_per_stage=3,
+        use_film_in_residual=True,
+    )
     model = MelTimeCVAE(enc, dec)
 
     # ====== モデル build（学習時と同じ呼び方で）=====
-    x_in = wav_to_mel_py(wav[0,:,0])  # (T, n_mels)
-    y_dummy = tf.zeros_like(x_in)
-
+    x_in = wav_to_mel_py(wav[0, :, 0])  # (T, n_mels)
     _ = model([x_in, cond])  # build only
 
     # ====== 重みロード ======
@@ -107,5 +112,15 @@ def infer(input_wav_name, out_name, cond):
     eps = tf.random.normal(shape=z_std.shape)
     z = z_mean + eps * z_std  # 再パラメータ化
     y_pred = model.decoder([z, cond], training=False)
-
+    mel_pred = mel_log_to_linear_mag(y_pred)  # (T, freq_bins)
+    wav_pred = mel_to_wave_via_griffinlim(
+        mel_pred,
+        sr=SR,
+        n_fft=N_FFT,
+        hop_length=HOP,
+        n_iter=60,
+        power=1.0,
+        n_mels=N_MELS,
+    )
+    sf.write(out_name, wav_pred, SR)
     print("推論完了")
