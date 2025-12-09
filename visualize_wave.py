@@ -3,7 +3,7 @@ import matplotlib.pyplot as plt
 import librosa
 import librosa.display
 
-gen_path = "y1.wav"  # 生成音
+gen_path = "BigVGAN/y1.wav"  # 生成音
 ref_path = "datasets/input_data/0013.wav"  # 教師データ
 
 # 読み込み
