@@ -15,7 +15,9 @@ import tensorflow.keras.layers as layers
 # -------------------------
 # ハイパーパラメータ（調整可）
 # -------------------------
-SR = 44100
+SR = 16000
+MAX_TIME = 4.0  # 秒
+MAX_LEN = SR * MAX_TIME  # 4秒（学習時の最大長、長い波形なら増やす）
 BATCH_SIZE = 4  # 長い波形なら小さめに
 LATENT_DIM = 128  # 時間方向の潜在次元（per time-step）
 ENC_CHANNELS = [64, 128, 256]
@@ -30,7 +32,7 @@ KL_WEIGHT_MAX = 0.5
 COMP_WEIGHT = 1.0
 ANNEAL_STEPS = 200000  # とてもゆっくり増やす（posterior collapse防止）
 FREE_BITS = 0.5  # free bits（nats） per latent-dimension (大きさは調整)
-STFT_FFTS = [256,512, 1024, 2048,4096]
+STFT_FFTS = [256, 512, 1024, 2048, 4096]
 MEL_BINS = 80
 
 # データ CSV パス
@@ -68,6 +70,22 @@ def get_mel_matrix(n_fft, n_mels=MEL_BINS, sr=SR, fmin=0.0, fmax=None):
         lower_edge_hertz=fmin,
         upper_edge_hertz=fmax,
     )
+
+
+def crop_or_pad(wav, target_len=MAX_LEN):
+    length = tf.shape(wav)[0]
+
+    def crop():
+        start = tf.random.uniform(
+            (), 0, length - target_len + 1, dtype=tf.int32
+        )
+        return wav[start : start + target_len]
+
+    def pad():
+        pad_len = target_len - length
+        return tf.pad(wav, [[0, pad_len]], constant_values=0.0)
+
+    return tf.cond(length > target_len, crop, pad)
 
 
 # -------------------------
@@ -116,19 +134,14 @@ def make_dataset_from_csv(
     # expand dims to [T,1]
     ds = ds.map(
         lambda x, y, c, lx, ly: (
-            tf.expand_dims(x, -1),
-            tf.expand_dims(y, -1),
+            tf.expand_dims(crop_or_pad(x), -1),
+            tf.expand_dims(crop_or_pad(y), -1),
             c,
             lx,
             ly,
         )
     )
-    # padded_batch（inputとoutputそれぞれ可変長）
-    ds = ds.padded_batch(
-        batch_size,
-        padded_shapes=([None, 1], [None, 1], [4], (), ()),
-        padding_values=(0.0, 0.0, 0.0, 0, 0),
-    )
+    ds = ds.batch(batch_size)
     ds = ds.prefetch(tf.data.AUTOTUNE)
     return ds
 
@@ -467,6 +480,8 @@ def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS, eps=1e-7):
     mel_hat = tf.maximum(mel_hat, eps)
 
     return tf.reduce_mean(tf.abs(tf.math.log(mel) - tf.math.log(mel_hat)))
+
+
 def complex_stft_loss(clean, pred, fft_sizes=[256, 512, 1024, 2048, 4096]):
     total_loss = 0.0
 
@@ -478,29 +493,30 @@ def complex_stft_loss(clean, pred, fft_sizes=[256, 512, 1024, 2048, 4096]):
             frame_length=n_fft,
             frame_step=hop,
             window_fn=tf.signal.hann_window,
-            pad_end=True
+            pad_end=True,
         )
         pred_stft = tf.signal.stft(
             pred,
             frame_length=n_fft,
             frame_step=hop,
             window_fn=tf.signal.hann_window,
-            pad_end=True
+            pad_end=True,
         )
 
         # フレーム数を短い側に揃える
-        min_frames = tf.minimum(
-            tf.shape(clean_stft)[1],
-            tf.shape(pred_stft)[1]
-        )
+        min_frames = tf.minimum(tf.shape(clean_stft)[1], tf.shape(pred_stft)[1])
         clean_stft = clean_stft[:, :min_frames, :]
         pred_stft = pred_stft[:, :min_frames, :]
 
         # Complex L1
-        real_loss = tf.reduce_mean(tf.abs(tf.math.real(pred_stft) - tf.math.real(clean_stft)))
-        imag_loss = tf.reduce_mean(tf.abs(tf.math.imag(pred_stft) - tf.math.imag(clean_stft)))
+        real_loss = tf.reduce_mean(
+            tf.abs(tf.math.real(pred_stft) - tf.math.real(clean_stft))
+        )
+        imag_loss = tf.reduce_mean(
+            tf.abs(tf.math.imag(pred_stft) - tf.math.imag(clean_stft))
+        )
 
-        total_loss += (real_loss + imag_loss)
+        total_loss += real_loss + imag_loss
 
     return total_loss / len(fft_sizes)
 
@@ -522,7 +538,7 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
         wave_weight=WAVE_L1_WEIGHT,
         stft_weight=STFT_WEIGHT,
         mel_weight=MEL_WEIGHT,
-        complex_weight=COMP_WEIGHT
+        complex_weight=COMP_WEIGHT,
     ):
         super().__init__()
         self.encoder = encoder
@@ -676,7 +692,7 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
 
             stft_loss = tf.add_n(stft_terms) / float(len(stft_terms))
 
-            loss_complex = complex_stft_loss( y, y_hat, fft_sizes=STFT_FFTS )
+            loss_complex = complex_stft_loss(y, y_hat, fft_sizes=STFT_FFTS)
 
             # mel loss (single resolution)
             mel_loss = mel_l1(y_s, yhat_s, n_fft=1024, hop=256, n_mels=MEL_BINS)
