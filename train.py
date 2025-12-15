@@ -28,10 +28,11 @@ EPOCHS = 200
 WAVE_L1_WEIGHT = 1.0
 STFT_WEIGHT = 1.2
 MEL_WEIGHT = 0.5
-KL_WEIGHT_MAX = 0.5
+KL_WEIGHT_MAX = 0.3
+WARMUP_STEPS = 2000  # KL weight を増やし始めるまでのステップ数
 COMP_WEIGHT = 1.0
-ANNEAL_STEPS = 200000  # とてもゆっくり増やす（posterior collapse防止）
-FREE_BITS = 0.5  # free bits（nats） per latent-dimension (大きさは調整)
+ANNEAL_STEPS = 20000  # とてもゆっくり増やす（posterior collapse防止）
+FREE_BITS = 0.25  # free bits（nats） per latent-dimension (大きさは調整)
 STFT_FFTS = [256, 512, 1024, 2048, 4096]
 MEL_BINS = 80
 
@@ -583,8 +584,14 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
 
     def kl_weight(self):
         step = tf.cast(self.total_steps, tf.float32)
-        s = tf.minimum(1.0, step / tf.cast(self.kl_anneal_steps, tf.float32))
-        return s * self.kl_weight_max
+        return tf.where(
+            step < WARMUP_STEPS,
+            0.0,
+            tf.minimum(
+                self.kl_weight_max,
+                (step - WARMUP_STEPS) / ANNEAL_STEPS * self.kl_weight_max,
+            ),
+        )
 
     def call(self, inputs, training=False):
         # 柔軟に入力数を判定
@@ -698,18 +705,14 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
             mel_loss = mel_l1(y_s, yhat_s, n_fft=1024, hop=256, n_mels=MEL_BINS)
 
             # KL per-dim per-time-step
-            kl_per = -0.5 * (
-                1.0 + logvar - tf.square(mean) - tf.exp(logvar)
-            )  # [B, Tz, D]
-            # sum over dim -> [B, Tz]
-            kl_time = tf.reduce_sum(kl_per, axis=-1)
-            # apply free bits: clip with lower bound FREE_BITS * D
-            free_bits_total = self.free_bits * tf.cast(
-                self.latent_dim, tf.float32
-            )
-            # we take mean over time and batch after applying free bits
-            kl_time_clipped = tf.maximum(kl_time, free_bits_total)
-            kl_loss = tf.reduce_mean(kl_time_clipped)
+            # [B, Tz, D]
+            kl_per = -0.5 * (1 + logvar - mean**2 - tf.exp(logvar))
+
+            # free bits per-dim
+            kl_per_clipped = tf.maximum(kl_per, self.free_bits)
+
+            # sum over dim, mean over time & batch
+            kl_loss = tf.reduce_mean(tf.reduce_sum(kl_per_clipped, axis=-1))
 
             kl_w = self.kl_weight()
             loss = (
