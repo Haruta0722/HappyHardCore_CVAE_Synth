@@ -16,7 +16,7 @@ import tensorflow.keras.layers as layers
 # ハイパーパラメータ（調整可）
 # -------------------------
 SR = 16000
-MAX_TIME = 4.0  # 秒
+MAX_TIME = 4  # 秒
 MAX_LEN = SR * MAX_TIME  # 4秒（学習時の最大長、長い波形なら増やす）
 BATCH_SIZE = 4  # 長い波形なら小さめに
 LATENT_DIM = 128  # 時間方向の潜在次元（per time-step）
