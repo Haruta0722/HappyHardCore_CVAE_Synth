@@ -18,8 +18,8 @@ class FiLM(tf.keras.layers.Layer):
 
     def call(self, x, cond):
         # x: (B, T, C)
-        g = self.gamma(cond)[:, None, :]
-        b = self.beta(cond)[:, None, :]
+        g = tf.tanh(self.gamma(cond)[:, None, :])
+        b = tf.tanh(self.beta(cond)[:, None, :])
         return g * x + b
 
 
