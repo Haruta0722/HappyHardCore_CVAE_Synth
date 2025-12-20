@@ -30,10 +30,9 @@ STFT_WEIGHT = 1.2
 MEL_WEIGHT = 0.5
 KL_WEIGHT_MAX = 0.3
 WARMUP_STEPS = 2000  # KL weight を増やし始めるまでのステップ数
-COMP_WEIGHT = 1.0
 ANNEAL_STEPS = 20000  # とてもゆっくり増やす（posterior collapse防止）
 FREE_BITS = 0.25  # free bits（nats） per latent-dimension (大きさは調整)
-STFT_FFTS = [256, 512, 1024, 2048, 4096]
+STFT_FFTS = [256, 512, 1024]  # 頭打ちになるたびに2048,4096を追加
 MEL_BINS = 80
 
 # データ CSV パス
@@ -343,7 +342,7 @@ def build_decoder(
     cond_dim=4,
     channels=[196, 192, 128],
     up_factors=[4, 4, 4],
-    n_dilated_per_stage=6,
+    n_dilated_per_stage=4,
     use_film_in_residual=True,
 ):
     z_in = layers.Input(shape=(None, latent_dim), name="dec_z_in")
@@ -483,43 +482,10 @@ def mel_l1(y, y_hat, n_fft=1024, hop=256, n_mels=MEL_BINS, eps=1e-7):
     return tf.reduce_mean(tf.abs(tf.math.log(mel) - tf.math.log(mel_hat)))
 
 
-def complex_stft_loss(clean, pred, fft_sizes=[256, 512, 1024, 2048, 4096]):
-    total_loss = 0.0
-
-    for n_fft in fft_sizes:
-        hop = n_fft // 4
-
-        clean_stft = tf.signal.stft(
-            clean,
-            frame_length=n_fft,
-            frame_step=hop,
-            window_fn=tf.signal.hann_window,
-            pad_end=True,
-        )
-        pred_stft = tf.signal.stft(
-            pred,
-            frame_length=n_fft,
-            frame_step=hop,
-            window_fn=tf.signal.hann_window,
-            pad_end=True,
-        )
-
-        # フレーム数を短い側に揃える
-        min_frames = tf.minimum(tf.shape(clean_stft)[1], tf.shape(pred_stft)[1])
-        clean_stft = clean_stft[:, :min_frames, :]
-        pred_stft = pred_stft[:, :min_frames, :]
-
-        # Complex L1
-        real_loss = tf.reduce_mean(
-            tf.abs(tf.math.real(pred_stft) - tf.math.real(clean_stft))
-        )
-        imag_loss = tf.reduce_mean(
-            tf.abs(tf.math.imag(pred_stft) - tf.math.imag(clean_stft))
-        )
-
-        total_loss += real_loss + imag_loss
-
-    return total_loss / len(fft_sizes)
+def temporal_diff_l1(y, y_hat):
+    dy = y[:, 1:] - y[:, :-1]
+    dy_hat = y_hat[:, 1:] - y_hat[:, :-1]
+    return tf.reduce_mean(tf.abs(dy - dy_hat))
 
 
 # -------------------------
@@ -539,7 +505,6 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
         wave_weight=WAVE_L1_WEIGHT,
         stft_weight=STFT_WEIGHT,
         mel_weight=MEL_WEIGHT,
-        complex_weight=COMP_WEIGHT,
     ):
         super().__init__()
         self.encoder = encoder
@@ -552,7 +517,7 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
         self.wave_weight = wave_weight
         self.stft_weight = stft_weight
         self.mel_weight = mel_weight
-        self.complex_weight = complex_weight
+
         # total_stepsをtf.Variableで管理
         initial_steps = initial_epoch * (steps_per_epoch or 0)
         self.total_steps = tf.Variable(
@@ -699,10 +664,10 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
 
             stft_loss = tf.add_n(stft_terms) / float(len(stft_terms))
 
-            loss_complex = complex_stft_loss(y, y_hat, fft_sizes=STFT_FFTS)
-
             # mel loss (single resolution)
             mel_loss = mel_l1(y_s, yhat_s, n_fft=1024, hop=256, n_mels=MEL_BINS)
+
+            diff_loss = temporal_diff_l1(S_y, S_hat)
 
             # KL per-dim per-time-step
             # [B, Tz, D]
@@ -719,7 +684,7 @@ class WaveTimeConditionalCVAE(tf.keras.Model):
                 self.wave_weight * recon_loss
                 + self.stft_weight * stft_loss
                 + self.mel_weight * mel_loss
-                + loss_complex * self.complex_weight
+                + diff_loss * 0.2
                 + kl_w * kl_loss
             )
 
