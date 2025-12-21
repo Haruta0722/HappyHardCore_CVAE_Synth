@@ -4,7 +4,7 @@ from loss import Loss
 SR = 48000
 COND_DIM = 3 + 1  # screech, acid, pluck + pitch
 LATENT_DIM = 32  # 各時間ステップあたりSR = 48000
-WAV_LENGTH = 1.4
+WAV_LENGTH = 1.3
 TIME_LENGTH = int(WAV_LENGTH * SR)
 STFT_FFTS = [256, 512, 1024]  # 頭打ちになるたびに2048,4096を追加
 channels = [(64, 7, 2), (128, 5, 2), (256, 5, 2), (256, 3, 2)]
@@ -20,7 +20,7 @@ class FiLM(tf.keras.layers.Layer):
         # x: (B, T, C)
         g = tf.tanh(self.gamma(cond)[:, None, :])
         b = tf.tanh(self.beta(cond)[:, None, :])
-        return g * x + b
+        return x + (g * x + b) * 0.1
 
 
 def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
@@ -47,7 +47,7 @@ def sample_z(z_mean, z_logvar):
 
 
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
-    z_in = tf.keras.Input(shape=(None, latent_dim))
+    z_in = tf.keras.Input(shape=(TIME_LENGTH // 16, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
     x = z_in
@@ -86,7 +86,9 @@ class TimeWiseCVAE(tf.keras.Model):
             )  # pyright: ignore[reportGeneralTypeIssues]
             z = sample_z(z_mean, z_logvar)
             x_hat = self.decoder([z, cond])
-
+            x_hat = x_hat[:, :TIME_LENGTH, :]
+            x = tf.squeeze(x, axis=-1)
+            x_hat = tf.squeeze(x_hat, axis=-1)
             recon = tf.reduce_mean(tf.square(x - x_hat))
             kl = -0.5 * tf.reduce_mean(
                 1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
@@ -97,10 +99,10 @@ class TimeWiseCVAE(tf.keras.Model):
 
             loss = (
                 recon
-                + 0.1 * kl
-                + stft_loss * 0.4
-                + mel_loss * 0.2
-                + diff_loss * 0.1
+                + 0.8 * kl
+                # + stft_loss * 0.4
+                # + mel_loss * 0.2
+                # + diff_loss * 0.1
             )  # ← KL弱め diff_loss弱め
 
         grads = tape.gradient(loss, self.trainable_variables)
