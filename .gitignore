@@ -10,3 +10,5 @@
 memo
 /checkpoints_cvae/
 /Flutter_app/
+/__pycache__/
+midi_project/__pycache__/

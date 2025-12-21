@@ -2,13 +2,19 @@ import os
 import numpy as np
 import pandas as pd
 import tensorflow as tf
+import librosa
+from model import SR
 
-
+MAX_LEN = int(SR * 1.3)
 # wav loader（既存のものを想定）
 def load_wav(path):
-    audio = tf.io.read_file(path)
-    wav, sr = tf.audio.decode_wav(audio, desired_channels=1)
-    return tf.squeeze(wav, axis=-1)
+    y, _ = librosa.load(path, sr=SR, mono=True)
+    # RMS normalize to preserve relative amplitude (avoid centering to zero mean causing trivial zero solution)
+    rms = np.sqrt(np.mean(y**2) + 1e-9)
+    target_rms = 0.1  # 小さめに揃える（調整可）
+    y = y / rms * target_rms
+    return y.astype(np.float32)
+
 
 
 def crop_or_pad(wav, target_len=MAX_LEN):
@@ -60,7 +66,6 @@ def make_dataset_from_synth_csv(
                 dtype=np.float32,
             )
 
-            length = np.int32(tf.shape(x)[0])
 
             # autoencoder なので x=y
             yield x, cond
