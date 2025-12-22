@@ -11,6 +11,10 @@ def train_model():
 
     os.makedirs("checkpoints", exist_ok=True)
 
+    for ds in dataset.take(1):
+        model.build(ds)
+        print("モデルの入力形状を構築しました。")
+
     checkpoint_cb = tf.keras.callbacks.ModelCheckpoint(
         filepath="checkpoints/epoch_{epoch:03d}.weights.h5",
         save_weights_only=True,  # True にすると軽量（おすすめ）
