@@ -24,6 +24,7 @@ def train_model():
         dataset,
         epochs=100,
         callbacks=[checkpoint_cb],
+        steps_per_epoch=87,
     )
 
 
