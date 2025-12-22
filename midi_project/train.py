@@ -5,7 +5,7 @@ import os
 
 
 def train_model():
-    dataset = make_dataset_from_synth_csv("dataset_filtered.csv", batch_size=16)
+    dataset = make_dataset_from_synth_csv("dataset.csv", batch_size=16)
     model = TimeWiseCVAE()
     model.compile(optimizer=tf.keras.optimizers.Adam(3e-5))
 
