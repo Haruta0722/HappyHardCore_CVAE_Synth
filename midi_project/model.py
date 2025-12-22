@@ -99,10 +99,10 @@ class TimeWiseCVAE(tf.keras.Model):
 
             loss = (
                 recon
-                + 0.8 * kl
-                # + stft_loss * 0.4
-                # + mel_loss * 0.2
-                # + diff_loss * 0.1
+                + 2 * kl
+                + stft_loss * 0.4
+                + mel_loss * 0.2
+                + diff_loss * 0.1
             )  # ← KL弱め diff_loss弱め
 
         grads = tape.gradient(loss, self.trainable_variables)
