@@ -172,9 +172,7 @@ def main():
     conds = np.stack([d[1] for d in small_data])
 
     for epoch in range(50):
-        history = model.fit(
-            [waves, conds], waves, batch_size=2, epochs=1, verbose=0
-        )
+        history = model.fit([waves, conds], batch_size=2, epochs=1, verbose=0)
 
         if epoch % 10 == 0:
             metrics = history.history
