@@ -200,6 +200,8 @@ def train_with_anti_collapse():
 
     # モデル構築
     model = AntiCollapseCVAE()
+    x_dummy, cond_dummy = next(iter(dataset))
+    _ = model((x_dummy, cond_dummy), training=False)
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4))
 
     # コールバック
