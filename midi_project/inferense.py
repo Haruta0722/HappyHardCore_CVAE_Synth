@@ -2,6 +2,7 @@ import soundfile as sf
 import tensorflow as tf
 from model import TimeWiseCVAE, LATENT_DIM
 from create_datasets import MAX_LEN
+import scipy.ndimage
 
 
 def inferense(pitch: float, cond: tuple[float, float, float]):
@@ -22,8 +23,9 @@ def inferense(pitch: float, cond: tuple[float, float, float]):
     cond_vector = tf.constant(
         [[pitch, *cond]], dtype=tf.float32
     )  # バッチサイズ1
-    z_seed = tf.random.normal(shape=(1, 1, LATENT_DIM))
-    z = tf.tile(z_seed, [1, MAX_LEN // 16, 1])
+    z = tf.random.normal(shape=(1, MAX_LEN // 16, LATENT_DIM))
+    z_smooth = scipy.ndimage.gaussian_filter1d(z, sigma=50, axis=1)
+    z = tf.convert_to_tensor(z_smooth)
     x_hat = model.decoder([z, cond_vector])
     x_hat = tf.squeeze(x_hat, axis=0).numpy()  # [T, 1] -> [T]
     sf.write("generated_output.wav", x_hat, samplerate=48000)
