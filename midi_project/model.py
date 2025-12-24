@@ -58,8 +58,9 @@ def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         padding="same",
         bias_initializer=tf.keras.initializers.Constant(-1.0),
     )(x)
-    z_logvar = tf.clip_by_value(z_logvar, -10.0, 2.0)
-
+    z_logvar = tf.keras.layers.Lambda(
+        lambda t: tf.clip_by_value(t, -10.0, 2.0)
+    )(z_logvar)
     return tf.keras.Model([x_in, cond], [z_mean, z_logvar], name="encoder")
 
 
