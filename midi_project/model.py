@@ -95,7 +95,6 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     out = tf.keras.layers.Conv1D(1, 7, padding="same", activation="tanh")(x)
 
     # サイズ補正: Upsamplingで端数が伸びている場合があるので、元の長さに切り取る
-    current_len = tf.shape(out)[1]
     out = out[:, :TIME_LENGTH, :]
     # もし静的にグラフを構築する場合のためにCropping層も検討できますが、
     # スライシングの方が柔軟です。
