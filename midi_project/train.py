@@ -1,4 +1,4 @@
-from model import build_decoder, build_encoder, TimeWiseCVAE
+from model import  TimeWiseCVAE
 from create_datasets import make_dataset_from_synth_csv
 import tensorflow as tf
 import os
