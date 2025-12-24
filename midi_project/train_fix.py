@@ -197,6 +197,7 @@ def train_with_anti_collapse():
     """
     # データ準備（既存のデータセットを使用）
     dataset = make_dataset_from_synth_csv("dataset.csv", batch_size=16)
+    dataset = dataset.repeat()
 
     # モデル構築
     model = AntiCollapseCVAE()
@@ -224,9 +225,7 @@ def train_with_anti_collapse():
 
     # 学習実行
     history = model.fit(
-        dataset,
-        epochs=200,
-        callbacks=callbacks,
+        dataset, epochs=200, callbacks=callbacks, steps_per_epoch=87
     )
 
     return model
