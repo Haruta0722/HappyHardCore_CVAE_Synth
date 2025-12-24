@@ -94,7 +94,9 @@ class TimeWiseCVAE(tf.keras.Model):
         self.encoder = build_encoder(cond_dim, latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
         # ★改善4: KLアニーリング用のトラッカー
-        self.kl_anneal_step = tf.Variable(0, trainable=False, dtype=tf.int32)
+        self.kl_anneal_step = self.add_weight(
+            name="kl_weight", shape=(), initializer="zeros", trainable=False
+        )
 
     def call(self, inputs):
         x, cond = inputs
