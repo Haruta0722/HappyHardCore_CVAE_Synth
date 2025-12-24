@@ -4,7 +4,7 @@ from model import TimeWiseCVAE, LATENT_DIM
 from create_datasets import MAX_LEN
 
 
-def inferense(pitch: int, cond: tuple[float, float, float]):
+def inferense(pitch: float, cond: tuple[float, float, float]):
     # モデル読み込み
     model = TimeWiseCVAE()
     model.build(
@@ -22,8 +22,8 @@ def inferense(pitch: int, cond: tuple[float, float, float]):
     cond_vector = tf.constant(
         [[pitch, *cond]], dtype=tf.float32
     )  # バッチサイズ1
-    z = tf.random.normal(shape=(1, MAX_LEN // 16, LATENT_DIM))
-
+    z_seed = tf.random.normal(shape=(1, 1, LATENT_DIM))
+    z = tf.tile(z_seed, [1, MAX_LEN // 16, 1])
     x_hat = model.decoder([z, cond_vector])
     x_hat = tf.squeeze(x_hat, axis=0).numpy()  # [T, 1] -> [T]
     sf.write("generated_output.wav", x_hat, samplerate=48000)
@@ -31,6 +31,7 @@ def inferense(pitch: int, cond: tuple[float, float, float]):
 
 if __name__ == "__main__":
     pitch = 60
+    pitch = (pitch - 36.0) / (71.0 - 36.0)
     cond = (0, 0, 1)  # screech, acid, pluck
     inferense(pitch, cond)
     print("生成された音声を 'generated_output.wav' に保存しました。")
