@@ -176,14 +176,14 @@ class TimeWiseCVAE(tf.keras.Model):
             # ★改善6: 段階的学習
             step = tf.cast(self.optimizer.iterations, tf.float32)
 
-            # Phase 1 (0-5000 steps): 再構成のみ
-            # Phase 2 (5000-15000): KLを徐々に追加
-            # Phase 3 (15000+): 全損失
+            # Phase 1 (0-1000 steps): 再構成のみ
+            # Phase 2 (1000-4000): KLを徐々に追加
+            # Phase 3 (4000+): 全損失
 
             kl_weight_schedule = tf.cond(
-                step < 5000.0,
+                step < 1000.0,
                 lambda: 0.0,
-                lambda: tf.minimum(0.001, (step - 5000.0) / 10000.0 * 0.001),
+                lambda: tf.minimum(0.005, (step - 1000.0) / 4000 * 0.005),
             )
 
             loss = (
