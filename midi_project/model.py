@@ -78,7 +78,9 @@ def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
             -3.0
         ),  # より小さい初期分散
     )(x)
-    z_logvar = tf.clip_by_value(z_logvar, -10.0, 2.0)
+    z_logvar = tf.keras.layers.Lambda(
+        lambda t: tf.clip_by_value(t, -10.0, 2.0)
+    )(z_logvar)
 
     return tf.keras.Model([x_in, cond], [z_mean, z_logvar], name="encoder")
 
@@ -104,11 +106,11 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         x = tf.keras.layers.LeakyReLU(0.2)(x)
 
     # 最終層の直前で周波数特徴を結合
-    x = x[:, :TIME_LENGTH, :]  # サイズ調整
+    x = tf.keras.layers.Lambda(lambda t: t[:, :TIME_LENGTH, :])(x)
     freq_feat_processed = tf.keras.layers.Conv1D(64, 3, padding="same")(
         freq_feat_in
     )
-    x = tf.concat([x, freq_feat_processed], axis=-1)
+    x = tf.keras.layers.Concatenate(axis=-1)([x, freq_feat_processed])
 
     # 最終出力
     out = tf.keras.layers.Conv1D(1, 15, padding="same", activation="tanh")(x)
