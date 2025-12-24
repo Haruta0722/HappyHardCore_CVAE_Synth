@@ -103,10 +103,20 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
 
 
 class TimeWiseCVAE(tf.keras.Model):
-    def __init__(self, cond_dim=COND_DIM, latent_dim=LATENT_DIM):
+    def __init__(
+        self,
+        cond_dim=COND_DIM,
+        latent_dim=LATENT_DIM,
+        kl_start=0.0,
+        kl_end=kl_weight,
+        kl_anneal_steps=20000,
+    ):
         super().__init__()
         self.encoder = build_encoder(cond_dim, latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
+        self.kl_start = kl_start
+        self.kl_end = kl_end
+        self.kl_anneal_steps = kl_anneal_steps
 
     def call(self, inputs):
         x, cond = inputs
@@ -114,6 +124,13 @@ class TimeWiseCVAE(tf.keras.Model):
         z = sample_z(z_mean, z_logvar)
         x_hat = self.decoder([z, cond])
         return x_hat, z_mean, z_logvar
+
+    def compute_kl_weight(self):
+        step = tf.cast(self.optimizer.iterations, tf.float32)
+        w = self.kl_start + (self.kl_end - self.kl_start) * (
+            step / self.kl_anneal_steps
+        )
+        return tf.minimum(w, self.kl_end)
 
     def train_step(self, data):
         x, cond = data
@@ -137,6 +154,7 @@ class TimeWiseCVAE(tf.keras.Model):
 
             # --- Loss計算 ---
             recon = tf.reduce_mean(tf.abs(x_target - x_hat_sq))
+            kl_w = self.compute_kl_weight()
 
             kl = -0.5 * tf.reduce_mean(
                 1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
@@ -150,8 +168,7 @@ class TimeWiseCVAE(tf.keras.Model):
             # 将来的には KL annealing (epochが進むにつれ係数を増やす) を推奨
             loss = (
                 recon * recon_weight  # 波形レベルのMSEを強めに
-                + kl
-                * kl_weight  # KLは最初非常に小さく（0.0001とかでもいいくらい）
+                + kl * kl_w  # KLは最初非常に小さく（0.0001とかでもいいくらい）
                 + stft_loss * STFT_weight  # スペクトル損失をメインに据える
                 + mel_loss * mel_weight
                 + diff_loss
