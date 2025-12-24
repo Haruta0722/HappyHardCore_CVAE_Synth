@@ -1,103 +1,190 @@
 import soundfile as sf
 import tensorflow as tf
 import numpy as np
-from model import TimeWiseCVAE, LATENT_DIM, LATENT_STEPS
+import matplotlib.pyplot as plt
+from model import TimeWiseCVAE, LATENT_DIM, LATENT_STEPS, TIME_LENGTH
 
 
-def inference(pitch: float, cond: tuple[float, float, float], temperature=0.8):
+def diagnose_model(ckpt_path="weights/epoch_100.weights.h5"):
     """
-    音声を生成
+    モデルの状態を診断
+    潜在変数が使われているかを確認
+    """
+    print("=" * 60)
+    print("モデル診断")
+    print("=" * 60)
+
+    model = TimeWiseCVAE()
+    model.build(
+        [
+            (None, TIME_LENGTH, 1),
+            (None, 4),
+        ]
+    )
+    model.load_weights(ckpt_path)
+
+    # テストデータで潜在変数の分散を確認
+    test_pitches = [48, 60, 72]  # C3, C4, C5
+
+    for pitch in test_pitches:
+        pitch_norm = (pitch - 36.0) / 35.0
+        cond = tf.constant([[pitch_norm, 0, 0, 1]], dtype=tf.float32)
+
+        # ダミー入力（ノイズ）
+        dummy_x = tf.random.normal((1, TIME_LENGTH, 1))
+
+        z_mean, z_logvar = model.encoder([dummy_x, cond])
+
+        mean_std = tf.reduce_mean(tf.math.reduce_std(z_mean, axis=1)).numpy()
+        logvar_mean = tf.reduce_mean(z_logvar).numpy()
+
+        print(
+            f"Pitch {pitch:2d}: z_mean_std={mean_std:.4f}, z_logvar_mean={logvar_mean:.4f}"
+        )
+
+    print("\n診断結果:")
+    if mean_std < 0.01:
+        print("⚠️  WARNING: 潜在変数の分散が極端に小さい（Posterior Collapse）")
+    elif mean_std > 2.0:
+        print("⚠️  WARNING: 潜在変数の分散が大きすぎる（学習不安定）")
+    else:
+        print("✓ 潜在変数は適切に使われています")
+
+    print("=" * 60)
+
+
+def inference(
+    pitch: float,
+    cond: tuple[float, float, float],
+    ckpt_path="weights/epoch_100.weights.h5",
+    use_mean=False,
+    temperature=0.8,
+):
+    """
+    音声生成
 
     Args:
-        pitch: MIDI音高 (36-71の範囲)
-        cond: (screech, acid, pluck) の3つ組
-        temperature: 生成のランダム性 (0.5-1.5推奨)
-    """
-    # モデル読み込み
-    model = TimeWiseCVAE()
-    model.build(
-        [
-            (None, 62400, 1),  # TIME_LENGTHを明示
-            (None, 4),
-        ]
-    )
-
-    ckpt_path = "weights/epoch_100.weights.h5"
-    model.load_weights(ckpt_path)
-    print(f"✓ モデルの重みを読み込みました: {ckpt_path}")
-
-    # 条件ベクトル作成
-    pitch_normalized = (pitch - 36.0) / (71.0 - 36.0)
-    cond_vector = tf.constant([[pitch_normalized, *cond]], dtype=tf.float32)
-
-    # ★改善7: 正しいステップ数でzを生成
-    # temperatureで生成のランダム性を調整
-    z = tf.random.normal(
-        shape=(1, LATENT_STEPS, LATENT_DIM), stddev=temperature
-    )
-
-    # デコード
-    x_hat = model.decoder([z, cond_vector])
-    x_hat = tf.squeeze(x_hat, axis=0).numpy()
-
-    # 正規化して保存
-    x_hat = x_hat / (np.max(np.abs(x_hat)) + 1e-8) * 0.95
-    sf.write("generated_output.wav", x_hat, samplerate=48000)
-
-    print(f"✓ 生成完了: pitch={pitch:.1f}, cond={cond}, temp={temperature}")
-    return x_hat
-
-
-def inference_from_latent_mean(pitch: float, cond: tuple[float, float, float]):
-    """
-    ランダムサンプリングではなく、潜在空間の平均値を使って生成
-    より安定した出力が得られる
+        pitch: MIDI音高 (36-71)
+        cond: (screech, acid, pluck)
+        use_mean: Trueの場合、zの平均値(ゼロ)を使用
+        temperature: ランダム性の強さ
     """
     model = TimeWiseCVAE()
     model.build(
         [
-            (None, 62400, 1),
+            (None, TIME_LENGTH, 1),
             (None, 4),
         ]
     )
-
-    ckpt_path = "weights/epoch_100.weights.h5"
     model.load_weights(ckpt_path)
 
-    pitch_normalized = (pitch - 36.0) / (71.0 - 36.0)
+    pitch_normalized = (pitch - 36.0) / 35.0
     cond_vector = tf.constant([[pitch_normalized, *cond]], dtype=tf.float32)
 
-    # ★改善8: ゼロ平均の潜在ベクトルを使用
-    z = tf.zeros(shape=(1, LATENT_STEPS, LATENT_DIM), dtype=tf.float32)
+    if use_mean:
+        # 条件ベクトルだけで生成（デバッグ用）
+        z = tf.zeros((1, LATENT_STEPS, LATENT_DIM))
+        suffix = "_mean"
+    else:
+        z = tf.random.normal((1, LATENT_STEPS, LATENT_DIM), stddev=temperature)
+        suffix = f"_temp{temperature}"
 
     x_hat = model.decoder([z, cond_vector])
-    x_hat = tf.squeeze(x_hat, axis=0).numpy()
-    x_hat = x_hat / (np.max(np.abs(x_hat)) + 1e-8) * 0.95
+    x_hat = tf.squeeze(x_hat).numpy()
 
-    sf.write("generated_output_mean.wav", x_hat, samplerate=48000)
-    print(f"✓ 平均値で生成完了: pitch={pitch:.1f}, cond={cond}")
-    return x_hat
+    # 正規化
+    max_val = np.max(np.abs(x_hat))
+    if max_val > 1e-6:
+        x_hat = x_hat / max_val * 0.95
+
+    filename = (
+        f"gen_p{int(pitch)}_{''.join(map(str, map(int, cond)))}{suffix}.wav"
+    )
+    sf.write(filename, x_hat, samplerate=48000)
+
+    print(f"✓ 生成: {filename} (max_amp={max_val:.4f})")
+    return x_hat, filename
+
+
+def test_pitch_response(ckpt_path="weights/epoch_100.weights.h5"):
+    """
+    音高応答テスト: 異なる音高で生成して比較
+    """
+    print("\n" + "=" * 60)
+    print("音高応答テスト")
+    print("=" * 60)
+
+    pitches = [36, 48, 60, 72]  # C2, C3, C4, C5
+    cond = (0, 0, 1)  # pluck
+
+    waveforms = []
+
+    for pitch in pitches:
+        wav, filename = inference(pitch, cond, ckpt_path, use_mean=True)
+        waveforms.append(wav)
+
+        # 簡易的な基本周波数推定（ゼロ交差）
+        zero_crossings = np.where(np.diff(np.sign(wav)))[0]
+        if len(zero_crossings) > 1:
+            avg_period = np.mean(np.diff(zero_crossings))
+            estimated_freq = 48000 / (2 * avg_period)
+            expected_freq = 440 * 2 ** ((pitch - 69) / 12)
+            print(
+                f"  期待周波数: {expected_freq:.1f} Hz, 推定: {estimated_freq:.1f} Hz"
+            )
+
+    print("=" * 60)
+    return waveforms
+
+
+def visualize_spectrum(wav, sr=48000, title="Spectrum"):
+    """
+    スペクトル可視化
+    """
+    from scipy import signal
+
+    f, t, Sxx = signal.spectrogram(wav, sr, nperseg=2048)
+
+    plt.figure(figsize=(10, 4))
+    plt.pcolormesh(
+        t, f[:1000], 10 * np.log10(Sxx[:1000] + 1e-10), shading="auto"
+    )
+    plt.ylabel("Frequency [Hz]")
+    plt.xlabel("Time [sec]")
+    plt.title(title)
+    plt.colorbar(label="Power [dB]")
+    plt.tight_layout()
+    plt.savefig(f"{title.replace(' ', '_')}.png")
+    print(f"✓ スペクトログラムを保存: {title}.png")
 
 
 if __name__ == "__main__":
-    # テスト1: ランダムサンプリング
-    pitch = 60  # C4
-    cond = (0, 0, 1)  # pluckのみ
-    inference(pitch, cond, temperature=0.7)
+    ckpt = "weights/epoch_100.weights.h5"
 
-    # テスト2: 平均値での生成（より安定）
-    inference_from_latent_mean(pitch, cond)
+    # 1. モデル診断
+    diagnose_model(ckpt)
 
-    # テスト3: 異なる音高
-    for p in [
-        48,
-        60,
-    ]:  # C3, C4, C5
-        inference(p, (0, 0, 1), temperature=0.7)
-        sf.write(
-            f"generated_pitch_{p}.wav",
-            inference(p, cond, temperature=0.7),
-            samplerate=48000,
-        )
+    # 2. 音高応答テスト
+    waveforms = test_pitch_response(ckpt)
 
-    print("\n✓ すべての生成が完了しました")
+    # 3. スペクトル可視化
+    if len(waveforms) > 0:
+        visualize_spectrum(waveforms[2], title="Pitch_60_Spectrum")
+
+    # 4. 複数条件でテスト
+    print("\n" + "=" * 60)
+    print("音色バリエーションテスト")
+    print("=" * 60)
+
+    pitch = 60
+    conditions = [
+        (1, 0, 0),  # screech
+        (0, 1, 0),  # acid
+        (0, 0, 1),  # pluck
+        (0.5, 0.5, 0),  # screech + acid
+    ]
+
+    for cond in conditions:
+        inference(pitch, cond, ckpt, use_mean=False, temperature=0.7)
+
+    print("\n✓ すべてのテストが完了しました")
