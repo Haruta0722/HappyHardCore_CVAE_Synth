@@ -246,13 +246,13 @@ def diagnose_model(model):
 
     # ダミー入力で潜在変数の統計を確認
     dummy_waves = tf.keras.random.normal((20, TIME_LENGTH, 1))
-
+    cond_dim = tf.keras.random.normal((1, 4))  # ダミー条件ベクトル
     z_means = []
     z_logvars = []
 
     for i in range(20):
         wave = dummy_waves[i : i + 1]
-        z_mean, z_logvar = model.encoder(wave)
+        z_mean, z_logvar = model.encoder(wave, cond_dim)
         z_means.append(z_mean.numpy())
         z_logvars.append(z_logvar.numpy())
 
