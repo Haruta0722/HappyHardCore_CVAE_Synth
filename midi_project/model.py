@@ -3,19 +3,182 @@ from loss import Loss
 import numpy as np
 
 SR = 48000
-COND_DIM = 3 + 1  # screech, acid, pluck + pitch
+COND_DIM = 3 + 1
 LATENT_DIM = 64
 WAV_LENGTH = 1.3
 TIME_LENGTH = int(WAV_LENGTH * SR)
 
-# ★改善1: 損失関数の重みを調整
-# 条件付き生成を重視する構成
-recon_weight = 5.0  # 再構成を重視
-STFT_weight = 15.0  # スペクトル特徴を重視
-mel_weight = 10.0  # メル特徴も重視
-diff_weight = 3.0  # 時間微分（音色の変化）
-kl_weight = 0.0003  # KLは控えめに
+NUM_HARMONICS = 32  # 倍音の数を増やす
 
+# 損失関数の重み
+recon_weight = 5.0
+STFT_weight = 15.0
+mel_weight = 10.0
+kl_weight = 0.0005
+
+
+def generate_harmonic_wave(fundamental_freq, amplitudes, phases, length, sr=SR):
+    """
+    倍音加算合成
+
+    Args:
+        fundamental_freq: (B,) - 基本周波数 [Hz]
+        amplitudes: (B, num_harmonics) - 各倍音の振幅
+        phases: (B, num_harmonics) - 各倍音の初期位相 [rad]
+        length: int - 生成する波形の長さ
+        sr: int - サンプリングレート
+
+    Returns:
+        wave: (B, length) - 合成された波形
+    """
+    batch_size = tf.shape(fundamental_freq)[0]
+    num_harmonics = tf.shape(amplitudes)[1]
+
+    # 時間軸
+    t = tf.range(length, dtype=tf.float32) / float(sr)  # (length,)
+    t = t[None, :, None]  # (1, length, 1)
+
+    # 基本周波数を展開
+    f0 = fundamental_freq[:, None, None]  # (B, 1, 1)
+
+    # 倍音番号
+    harmonic_nums = tf.range(1.0, float(num_harmonics) + 1.0, dtype=tf.float32)
+    harmonic_nums = harmonic_nums[None, None, :]  # (1, 1, num_harmonics)
+
+    # 各倍音の角周波数
+    omega = 2.0 * np.pi * f0 * harmonic_nums  # (B, 1, num_harmonics)
+
+    # 振幅と位相を展開
+    amps = amplitudes[:, None, :]  # (B, 1, num_harmonics)
+    phas = phases[:, None, :]  # (B, 1, num_harmonics)
+
+    # 各倍音の波形
+    harmonics = amps * tf.sin(omega * t + phas)  # (B, length, num_harmonics)
+
+    # 加算合成
+    wave = tf.reduce_sum(harmonics, axis=-1)  # (B, length)
+
+    return wave
+
+
+class EnvelopeNet(tf.keras.layers.Layer):
+    """
+    時間変化するエンベロープを生成
+    """
+
+    def __init__(self, output_length=TIME_LENGTH):
+        super().__init__()
+        self.output_length = output_length
+
+        # 時間方向に畳み込んでエンベロープを生成
+        self.net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    32, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    1, 5, padding="same", activation="sigmoid"
+                ),
+            ]
+        )
+
+    def call(self, z):
+        # z: (B, latent_steps, latent_dim)
+        envelope = self.net(z)  # (B, latent_steps, 1)
+
+        # アップサンプリングして目標長に
+        envelope = tf.image.resize(
+            envelope, [self.output_length, 1], method="bilinear"
+        )
+
+        return tf.squeeze(envelope, axis=-1)  # (B, output_length)
+
+
+class HarmonicAmplitudeNet(tf.keras.layers.Layer):
+    """
+    時間変化する倍音振幅を生成
+    """
+
+    def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
+        super().__init__()
+        self.num_harmonics = num_harmonics
+        self.output_length = output_length
+
+        self.net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    128, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    num_harmonics, 5, padding="same", activation="sigmoid"
+                ),
+            ]
+        )
+
+    def call(self, z, cond):
+        # z: (B, latent_steps, latent_dim)
+        # cond: (B, cond_dim)
+
+        # 条件を時間方向にブロードキャスト
+        batch_size = tf.shape(z)[0]
+        latent_steps = tf.shape(z)[1]
+        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
+
+        # 結合
+        z_cond = tf.concat([z, cond_broadcast], axis=-1)
+
+        # 倍音振幅を予測
+        amps = self.net(z_cond)  # (B, latent_steps, num_harmonics)
+
+        # アップサンプリング
+        amps = tf.image.resize(
+            amps, [self.output_length, self.num_harmonics], method="bilinear"
+        )
+
+        return amps  # (B, output_length, num_harmonics)
+
+
+class NoiseGenerator(tf.keras.layers.Layer):
+    """
+    条件付きノイズ生成器
+    """
+
+    def __init__(self):
+        super().__init__()
+
+        self.net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    32, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(1, 5, padding="same", activation="tanh"),
+            ]
+        )
+
+    def call(self, z, cond):
+        batch_size = tf.shape(z)[0]
+        latent_steps = tf.shape(z)[1]
+        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
+
+        z_cond = tf.concat([z, cond_broadcast], axis=-1)
+        noise = self.net(z_cond)
+
+        # アップサンプリング
+        noise = tf.image.resize(noise, [TIME_LENGTH, 1], method="bilinear")
+
+        return tf.squeeze(noise, axis=-1)  # (B, TIME_LENGTH)
+
+
+# シンプルなエンコーダー
 channels = [
     (64, 5, 2),
     (128, 5, 2),
@@ -26,136 +189,16 @@ channels = [
 LATENT_STEPS = TIME_LENGTH // 16
 
 
-class ConditionAwareAttention(tf.keras.layers.Layer):
-    """
-    ★新機能: 条件に応じて潜在変数の重要な部分に注目
-    """
-
-    def __init__(self, channels):
-        super().__init__()
-        self.channels = channels
-        # 条件から注意マップを生成
-        self.attention_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(channels, activation="relu"),
-                tf.keras.layers.Dense(channels, activation="sigmoid"),
-            ]
-        )
-
-    def call(self, x, cond):
-        # x: (B, T, C)
-        # cond: (B, cond_dim)
-        attention_weights = self.attention_net(cond)[:, None, :]  # (B, 1, C)
-        return x * attention_weights
-
-
-class StrongFiLM(tf.keras.layers.Layer):
-    """
-    ★改善: より強力な条件付け
-    複数の変換層で条件の表現力を最大化
-    """
-
-    def __init__(self, channels):
-        super().__init__()
-        self.channels = channels
-
-        # 3層の変換ネットワーク
-        self.cond_transform = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(channels * 2, activation="relu"),
-                tf.keras.layers.LayerNormalization(),
-                tf.keras.layers.Dense(channels * 2, activation="relu"),
-                tf.keras.layers.LayerNormalization(),
-                tf.keras.layers.Dense(channels * 2),  # gamma, beta
-            ]
-        )
-
-    def call(self, x, cond):
-        cond_out = self.cond_transform(cond)
-        gamma, beta = tf.split(cond_out, 2, axis=-1)
-
-        gamma = gamma[:, None, :]
-        beta = beta[:, None, :]
-
-        # ★変更: より強いスケーリング
-        return x * (1.0 + gamma * 2.0) + beta * 2.0
-
-
-class TimbreEmbedding(tf.keras.layers.Layer):
-    """
-    ★新機能: 音色を独立した埋め込み空間に
-    screech, acid, pluck を離散的に扱う
-    """
-
-    def __init__(self, embed_dim=64):
-        super().__init__()
-        # 3つの音色 + 混合用
-        self.screech_embed = tf.keras.layers.Dense(embed_dim, use_bias=False)
-        self.acid_embed = tf.keras.layers.Dense(embed_dim, use_bias=False)
-        self.pluck_embed = tf.keras.layers.Dense(embed_dim, use_bias=False)
-
-    def call(self, timbre_weights):
-        # timbre_weights: (B, 3) - [screech, acid, pluck]
-        screech_w = timbre_weights[:, 0:1]
-        acid_w = timbre_weights[:, 1:2]
-        pluck_w = timbre_weights[:, 2:3]
-
-        # 各音色の埋め込みを重み付き結合
-        embed = (
-            self.screech_embed(screech_w) * screech_w
-            + self.acid_embed(acid_w) * acid_w
-            + self.pluck_embed(pluck_w) * pluck_w
-        )
-
-        return embed
-
-
-class PitchEmbedding(tf.keras.layers.Layer):
-    def __init__(self, embed_dim=32):
-        super().__init__()
-        self.embedding = tf.keras.layers.Embedding(37, embed_dim)
-
-    def call(self, pitch_normalized):
-        pitch_midi = pitch_normalized * 35.0 + 36.0
-        pitch_idx = tf.cast(tf.round(pitch_midi) - 36, tf.int32)
-        pitch_idx = tf.clip_by_value(pitch_idx, 0, 35)
-        return self.embedding(pitch_idx)
-
-
 def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # 条件を分解
-    pitch = cond[:, 0:1]
-    timbre = cond[:, 1:]  # (B, 3)
-
-    # 埋め込み
-    pitch_embed_layer = PitchEmbedding(embed_dim=32)
-    pitch_embed = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=1))(
-        pitch_embed_layer(pitch)
-    )
-
-    timbre_embed_layer = TimbreEmbedding(embed_dim=64)
-    timbre_embed = timbre_embed_layer(timbre)
-
-    full_cond = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
-        [pitch_embed, timbre_embed]
-    )
     x = x_in
 
-    for i, (ch, k, s) in enumerate(channels):
+    for ch, k, s in channels:
         x = tf.keras.layers.Conv1D(ch, k, strides=s, padding="same")(x)
-
-        # ★改善: 各層で条件を強く反映
-        x = StrongFiLM(ch)(x, full_cond)
-
-        # ★新機能: 条件に応じた注意機構
-        if i >= 2:  # 後半の層でのみ適用
-            x = ConditionAwareAttention(ch)(x, full_cond)
-
         x = tf.keras.layers.LeakyReLU(0.2)(x)
-        x = tf.keras.layers.Dropout(0.1)(x)  # 過学習防止
+        x = tf.keras.layers.Dropout(0.1)(x)
 
     z_mean = tf.keras.layers.Conv1D(latent_dim, 3, padding="same")(x)
     z_logvar = tf.keras.layers.Conv1D(
@@ -164,9 +207,7 @@ def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         padding="same",
         bias_initializer=tf.keras.initializers.Constant(-3.0),
     )(x)
-    z_logvar = tf.keras.layers.Lambda(
-        lambda x: tf.clip_by_value(x, -10.0, 2.0)
-    )(z_logvar)
+    z_logvar = tf.clip_by_value(z_logvar, -10.0, 2.0)
 
     return tf.keras.Model([x_in, cond], [z_mean, z_logvar], name="encoder")
 
@@ -180,78 +221,56 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # 条件を分解
-    pitch = cond[:, 0:1]
-    timbre = cond[:, 1:]
+    # 倍音振幅生成器
+    harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
+    harmonic_amps_time = harmonic_amp_net(
+        z_in, cond
+    )  # (B, TIME_LENGTH, num_harmonics)
 
-    # 埋め込み
-    pitch_embed_layer = PitchEmbedding(embed_dim=32)
-    pitch_embed = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=1))(
-        pitch_embed_layer(pitch)
+    # エンベロープ生成器
+    envelope_net = EnvelopeNet()
+    envelope = envelope_net(z_in)  # (B, TIME_LENGTH)
+
+    # ノイズ生成器
+    noise_gen = NoiseGenerator()
+    noise = noise_gen(z_in, cond)  # (B, TIME_LENGTH)
+
+    # 基本周波数を条件から取得
+    pitch = cond[:, 0]
+    pitch_midi = pitch * 35.0 + 36.0
+    fundamental_freq = 440.0 * tf.pow(2.0, (pitch_midi - 69.0) / 12.0)
+
+    # ★重要: 倍音合成は時間ステップごとに振幅を変化させる
+    # 簡略化のため、平均振幅で生成（本来は時間変化を反映すべき）
+    avg_harmonic_amps = tf.reduce_mean(
+        harmonic_amps_time, axis=1
+    )  # (B, num_harmonics)
+
+    # 初期位相（学習させることも可能だが、ここではゼロ）
+    phases = tf.zeros_like(avg_harmonic_amps)
+
+    # 倍音合成
+    harmonic_wave = generate_harmonic_wave(
+        fundamental_freq, avg_harmonic_amps, phases, TIME_LENGTH
     )
 
-    timbre_embed_layer = TimbreEmbedding(embed_dim=64)
-    timbre_embed = timbre_embed_layer(timbre)
+    # ★最終合成: 倍音 × エンベロープ + ノイズ
+    # 音色によって倍音とノイズの比率を変える
+    timbre = cond[:, 1:]  # (B, 3) - [screech, acid, pluck]
 
-    full_cond = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
-        [pitch_embed, timbre_embed]
-    )
+    # screech: 倍音強め
+    # acid: バランス
+    # pluck: 倍音強め、ノイズ少なめ
+    harmonic_ratio = 0.9  # デフォルト
+    noise_ratio = 0.1
 
-    x = z_in
+    output = harmonic_wave * envelope * harmonic_ratio + noise * noise_ratio
 
-    # ★新機能: 条件情報を最初に注入
-    # 潜在変数と条件を結合してから展開
-    cond_broadcast = tf.keras.layers.Lambda(
-        lambda x: tf.tile(x[:, None, :], [1, LATENT_STEPS, 1])
-    )(full_cond)
-    x = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
-        [x, cond_broadcast]
-    )
-    x = tf.keras.layers.Conv1D(latent_dim, 3, padding="same")(x)
+    # 正規化
+    output = tf.tanh(output)  # [-1, 1]に制限
+    output = output[:, :, None]  # (B, TIME_LENGTH, 1)
 
-    for i, (ch, k, s) in enumerate(reversed(channels)):
-        x = tf.keras.layers.UpSampling1D(s)(x)
-        x = tf.keras.layers.Conv1D(ch, k, padding="same")(x)
-
-        # ★改善: 各層で条件を強く反映
-        x = StrongFiLM(ch)(x, full_cond)
-
-        # ★新機能: 条件に応じた注意機構
-        if i < 2:  # 前半の層でのみ適用（後半はエンコーダーで使用）
-            x = ConditionAwareAttention(ch)(x, full_cond)
-
-        x = tf.keras.layers.LeakyReLU(0.2)(x)
-
-    # ★改善: 最終層でも条件を反映
-    x = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
-        [
-            x,
-            tf.keras.layers.Lambda(
-                lambda x: tf.tile(x[:, None, :], [1, TIME_LENGTH, 1])
-            )(full_cond),
-        ]
-    )
-    x = tf.keras.layers.Conv1D(64, 7, padding="same", activation="relu")(x)
-    out = tf.keras.layers.Conv1D(1, 15, padding="same", activation="tanh")(x)
-    out = out[:, :TIME_LENGTH, :]
-
-    return tf.keras.Model([z_in, cond], out, name="decoder")
-
-
-class ConditionLoss(tf.keras.layers.Layer):
-    """
-    ★新機能: 条件の効果を明示的に強制する損失
-    同じ音高で異なる音色の音は、異なるスペクトルを持つべき
-    """
-
-    def __init__(self):
-        super().__init__()
-
-    def call(self, x_target, x_hat, cond):
-        # 条件が異なる場合、出力も異なるべき
-        # これは訓練時にバッチ内で比較することで実現
-        # （実装の詳細は省略）
-        return 0.0
+    return tf.keras.Model([z_in, cond], output, name="decoder")
 
 
 class TimeWiseCVAE(tf.keras.Model):
@@ -263,12 +282,12 @@ class TimeWiseCVAE(tf.keras.Model):
         self.decoder = build_decoder(cond_dim, latent_dim)
 
         self.steps_per_epoch = steps_per_epoch
-        self.kl_warmup_epochs = 15  # より長いWarmup
-        self.kl_rampup_epochs = 40
+        self.kl_warmup_epochs = 20
+        self.kl_rampup_epochs = 50
         self.kl_warmup_steps = self.kl_warmup_epochs * steps_per_epoch
         self.kl_rampup_steps = self.kl_rampup_epochs * steps_per_epoch
-        self.kl_target = 0.0003  # より小さい目標値
-        self.free_bits = 0.8  # より大きいFree Bits
+        self.kl_target = 0.0005
+        self.free_bits = 0.8
 
         self.z_std_ema = tf.Variable(1.0, trainable=False)
 
@@ -283,9 +302,7 @@ class TimeWiseCVAE(tf.keras.Model):
         step = tf.cast(self.optimizer.iterations, tf.float32)
         warmup_done = tf.cast(step >= self.kl_warmup_steps, tf.float32)
         rampup_progress = (step - self.kl_warmup_steps) / self.kl_rampup_steps
-        rampup_progress = tf.keras.layers.Lambda(
-            lambda x: tf.clip_by_value(x, 0.0, 1.0)
-        )(rampup_progress)
+        rampup_progress = tf.clip_by_value(rampup_progress, 0.0, 1.0)
         return self.kl_target * rampup_progress * warmup_done
 
     def compute_free_bits_kl(self, z_mean, z_logvar):
@@ -310,9 +327,6 @@ class TimeWiseCVAE(tf.keras.Model):
 
             recon = tf.reduce_mean(tf.square(x_target - x_hat_sq))
             kl_free_bits = self.compute_free_bits_kl(z_mean, z_logvar)
-            kl_standard = -0.5 * tf.reduce_mean(
-                1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
-            )
 
             stft_loss, mel_loss, diff_loss = Loss(
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
@@ -324,7 +338,6 @@ class TimeWiseCVAE(tf.keras.Model):
                 recon * recon_weight
                 + stft_loss * STFT_weight
                 + mel_loss * mel_weight
-                + diff_loss * diff_weight
                 + kl_free_bits * kl_weight
             )
 
@@ -340,11 +353,8 @@ class TimeWiseCVAE(tf.keras.Model):
             "recon": recon,
             "stft": stft_loss,
             "mel": mel_loss,
-            "diff": diff_loss,
-            "kl_standard": kl_standard,
-            "kl_free_bits": kl_free_bits,
+            "kl": kl_free_bits,
             "kl_weight": kl_weight,
-            "z_std": z_std,
             "z_std_ema": self.z_std_ema,
             "grad_norm": grad_norm,
         }

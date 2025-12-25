@@ -4,10 +4,28 @@ import tensorflow as tf
 import os
 
 
-def train_model():
+def train_model(resume_checkpoint=True):
     dataset = make_dataset_from_synth_csv("dataset.csv", batch_size=16)
     model = TimeWiseCVAE()
     model.compile(optimizer=tf.keras.optimizers.Adam(3e-5))
+
+    checkpoint_path = "checkpoints/best_model.weights.h5"
+    initial_epoch = 0
+    if resume_checkpoint and os.path.exists(checkpoint_path):
+        print(f"🔄  チェックポイントを発見: {checkpoint_path} から学習再開")
+        model.load_weights(checkpoint_path)
+        # CSVログから最後のepochを取得して再開epochを設定
+        import csv
+
+        if os.path.exists("training_log.csv"):
+            with open("training_log.csv", "r") as f:
+                reader = list(csv.reader(f))
+                if len(reader) > 1:
+                    last_epoch = int(reader[-1][0])
+                    initial_epoch = last_epoch + 1
+                    print(f"  CSVログより初期エポックを {initial_epoch} に設定")
+    else:
+        print("🆕  新規学習を開始します")
 
     os.makedirs("checkpoints", exist_ok=True)
 
