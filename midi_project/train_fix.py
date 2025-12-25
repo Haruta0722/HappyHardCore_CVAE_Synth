@@ -218,9 +218,6 @@ def train_with_anti_collapse():
         tf.keras.callbacks.ReduceLROnPlateau(
             monitor="loss", factor=0.5, patience=10, min_lr=1e-6
         ),
-        tf.keras.callbacks.EarlyStopping(
-            monitor="collapse_warning", patience=20, restore_best_weights=True
-        ),
     ]
 
     # 学習実行
