@@ -279,7 +279,7 @@ class TimeWiseCVAE(tf.keras.Model):
         self, cond_dim=COND_DIM, latent_dim=LATENT_DIM, steps_per_epoch=87
     ):
         super().__init__()
-        self.encoder = build_encoder(cond_dim, latent_dim)
+        self.encoder = build_encoder(latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
 
         self.steps_per_epoch = steps_per_epoch
