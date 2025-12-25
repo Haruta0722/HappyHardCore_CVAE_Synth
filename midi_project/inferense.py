@@ -2,7 +2,7 @@ import soundfile as sf
 import tensorflow as tf
 import numpy as np
 from model import TimeWiseCVAE, LATENT_DIM, generate_frequency_features
-from create_datasets import MAX_LEN
+from create_datasets import MAX_LEN, load_wav, crop_or_pad
 
 
 def diagnose_latent_space(model, n_samples=50):
@@ -20,40 +20,57 @@ def diagnose_latent_space(model, n_samples=50):
 
     z_means = []
     z_logvars = []
+    z_samples = []  # 実際のサンプリングも記録
 
     for i in range(n_samples):
         wave = dummy_waves[i : i + 1]
         cond = dummy_conds[i : i + 1]
         z_mean, z_logvar = model.encoder([wave, cond])
+
+        # 学習時と同じ方法でサンプリング
+        eps = tf.random.normal(shape=tf.shape(z_mean))
+        z_sample = z_mean + tf.exp(0.5 * z_logvar) * eps
+
         z_means.append(z_mean.numpy())
         z_logvars.append(z_logvar.numpy())
+        z_samples.append(z_sample.numpy())
 
     z_means = np.concatenate(z_means, axis=0)
     z_logvars = np.concatenate(z_logvars, axis=0)
+    z_samples = np.concatenate(z_samples, axis=0)
 
     # 統計計算
     mean_of_means = np.mean(z_means)
     std_of_means = np.std(z_means)
     mean_of_logvars = np.mean(z_logvars)
+    std_of_samples = np.std(z_samples)  # ★重要: 実際のサンプルの分散
 
     print(f"z_mean の平均: {mean_of_means:.6f}")
     print(f"z_mean の標準偏差: {std_of_means:.6f}")
     print(f"z_logvar の平均: {mean_of_logvars:.6f}")
-    print(f"推定される z の標準偏差: {np.exp(0.5 * mean_of_logvars):.6f}")
+    print(
+        f"z_logvar から推定される stddev: {np.exp(0.5 * mean_of_logvars):.6f}"
+    )
+    print(f"実際の z サンプルの標準偏差: {std_of_samples:.6f}")  # ★これが正解
 
     print("\n診断結果:")
     if std_of_means < 0.01:
         print("⚠️  CRITICAL: Posterior Collapse! zがほぼ使われていません")
         print("   → 推論時はz=0を使うか、学習をやり直してください")
-        return 0.0, True  # std, collapsed
-    elif std_of_means < 0.1:
-        print("⚠️  WARNING: zの分散が小さい（部分的Collapse）")
-        print(f"   → 推論時は temperature={std_of_means:.3f} を使用推奨")
-        return std_of_means, False
+        return 0.0, True
     else:
         print("✓ zは適切に活用されています")
-        print(f"   → 推論時は temperature={std_of_means:.3f} を使用推奨")
-        return std_of_means, False
+        # ★修正: 実際のサンプルの分散を使用
+        recommended_temp = std_of_samples
+        print(f"   → 推論時は temperature={recommended_temp:.3f} を使用推奨")
+
+        # 警告: z_mean と z_logvar の矛盾を検出
+        if std_of_means > 1.0 and np.exp(0.5 * mean_of_logvars) < 0.1:
+            print("\n⚠️  注意: z_logvar が過度に小さい")
+            print("   学習時はほぼ z_mean のみが使われています")
+            print("   推論時は z_mean に近い値を使うか、参照ベースの生成を推奨")
+
+        return recommended_temp, False
 
     print("=" * 60 + "\n")
 
@@ -101,23 +118,22 @@ def inference_with_learned_distribution(
 ):
     """
     学習済み分布からサンプリング
-    エンコーダーで学習したzの分布を使う
+    ★重要: 学習時と同じ方法でzを生成
     """
     print(f"\n[生成] temperature={temperature:.3f} でサンプリング中...")
 
     cond_vector = tf.constant([[pitch, *cond]], dtype=tf.float32)
 
-    # ★改善1: ダミー入力を使ってzの平均を推定
-    # 本来は学習データから計算すべきだが、簡易的にランダム入力で近似
+    # ★修正: ダミー入力を使ってz_meanとz_logvarを推定
     dummy_wave = tf.random.normal((1, MAX_LEN, 1), stddev=0.1)
     z_mean_ref, z_logvar_ref = model.encoder([dummy_wave, cond_vector])
 
-    # 学習済み分布に基づいてサンプリング
-    z = tf.random.normal(
-        shape=tf.shape(z_mean_ref),
-        mean=tf.reduce_mean(z_mean_ref),  # 平均を維持
-        stddev=temperature,  # temperatureで制御
-    )
+    # ★重要: 学習時と同じサンプリング方法
+    # z = z_mean + exp(0.5 * z_logvar) * eps
+    eps = tf.random.normal(shape=tf.shape(z_mean_ref))
+
+    # temperatureは eps にかける（z_meanのスケールは維持）
+    z = z_mean_ref + tf.exp(0.5 * z_logvar_ref) * eps * temperature
 
     pitch_tensor = cond_vector[:, 0]
     freq_feat = generate_frequency_features(pitch_tensor, MAX_LEN)
@@ -157,7 +173,18 @@ def inference_from_reference(
         reference_wave = 0.5 * np.sin(2 * np.pi * freq * t)
         reference_wave = reference_wave[:, None].astype(np.float32)
 
-    reference_wave = tf.constant(reference_wave[None, :, :], dtype=tf.float32)
+    reference_wave = np.asarray(reference_wave)
+
+    # (T,) → (T, 1)
+    if reference_wave.ndim == 1:
+        reference_wave = crop_or_pad(reference_wave)
+        reference_wave = reference_wave[:, None]
+
+    # (T, 1) → (1, T, 1)
+    reference_wave = reference_wave[None, :, :]
+
+    reference_wave = tf.constant(reference_wave, dtype=tf.float32)
+
     cond_vector = tf.constant([[pitch, *cond]], dtype=tf.float32)
 
     # 参照からzを抽出
@@ -195,7 +222,7 @@ def main():
         ]
     )
 
-    ckpt_path = "checkpoints/epoch_100.weights.h5"
+    ckpt_path = "weights/epoch_100.weights.h5"
     model.load_weights(ckpt_path)
     print(f"✓ モデルの重みを読み込みました: {ckpt_path}")
 
@@ -205,7 +232,9 @@ def main():
     # テスト条件
     pitch = 60
     pitch_norm = (pitch - 36.0) / 35.0
-    cond = (0, 0, 1)  # pluck
+    cond = (1, 0, 0)  # pluck
+
+    reference = load_wav("datasets/C2/0017.wav")
 
     print("\n" + "=" * 60)
     print(f"生成テスト: pitch={pitch} (MIDI), cond={cond}")
@@ -248,7 +277,11 @@ def main():
 
     # 方法4: 参照音声ベース（常に実行）
     inference_from_reference(
-        pitch_norm, cond, model, output_name="output_method4_reference.wav"
+        pitch_norm,
+        cond,
+        model,
+        reference_wave=reference,
+        output_name="output_method4_reference.wav",
     )
 
     print("\n" + "=" * 60)
