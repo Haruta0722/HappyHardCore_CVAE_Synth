@@ -65,7 +65,6 @@ class EnvelopeNet(tf.keras.layers.Layer):
 
         self.net = tf.keras.Sequential(
             [
-                # ★軽量化2: チャンネル数を少し調整（64->32でも十分性能は出ます）
                 tf.keras.layers.Conv1D(
                     64, 5, padding="same", activation="relu"
                 ),
@@ -79,13 +78,17 @@ class EnvelopeNet(tf.keras.layers.Layer):
         )
 
     def call(self, z):
-        # z は以前より時間解像度が低い (1/64)
         x = self.net(z)
 
-        # 低解像度で概形を作ってからアップサンプリング（計算コスト大幅減）
+        # 修正: 同様に4次元経由でリサイズ
         x = tf.keras.layers.Lambda(
-            lambda v: tf.image.resize(
-                v, [self.output_length, 1], method="bilinear"
+            lambda v: tf.squeeze(
+                tf.image.resize(
+                    tf.expand_dims(v, axis=2),
+                    [self.output_length, 1],
+                    method="bilinear",
+                ),
+                axis=2,
             )
         )(x)
         return tf.squeeze(x, axis=-1)
@@ -118,24 +121,25 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        amps = self.net(z_cond)
+        amps = self.net(z_cond)  # (B, T_low, H)
 
-        # アップサンプリング
+        # 修正: 4次元に拡張してからリサイズし、3次元に戻す
+        # (B, T, H) -> (B, T, 1, H) -> resize -> (B, Output_T, 1, H) -> (B, Output_T, H)
         amps = tf.keras.layers.Lambda(
-            lambda v: tf.image.resize(
-                v, [self.output_length, self.num_harmonics], method="bilinear"
+            lambda v: tf.squeeze(
+                tf.image.resize(
+                    tf.expand_dims(v, axis=2),
+                    [self.output_length, 1],
+                    method="bilinear",
+                ),
+                axis=2,
             )
         )(amps)
+
         return amps
 
 
 class NoiseGenerator(tf.keras.layers.Layer):
-    """
-    ★軽量化3: Source-Filterモデルへの変更
-    以前: ニューラルネットが波形そのものを描こうとしていた (高負荷 & 低品質)
-    今回: ニューラルネットは「音量(エンベロープ)」だけ予測し、ノイズと掛ける (低負荷 & 高品質)
-    """
-
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
@@ -146,7 +150,7 @@ class NoiseGenerator(tf.keras.layers.Layer):
                 ),
                 tf.keras.layers.Conv1D(
                     1, 5, padding="same", activation="sigmoid"
-                ),  # 音量なので0-1
+                ),
             ]
         )
 
@@ -155,25 +159,24 @@ class NoiseGenerator(tf.keras.layers.Layer):
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        # ノイズのエンベロープを予測
         noise_env = self.net(z_cond)
 
-        # エンベロープをアップサンプリング
+        # 修正: 同様に4次元経由でリサイズ
         noise_env = tf.keras.layers.Lambda(
-            lambda v: tf.image.resize(
-                v, [self.output_length, 1], method="bilinear"
+            lambda v: tf.squeeze(
+                tf.image.resize(
+                    tf.expand_dims(v, axis=2),
+                    [self.output_length, 1],
+                    method="bilinear",
+                ),
+                axis=2,
             )
-        )(
-            noise_env
-        )  # (B, T, 1)
+        )(noise_env)
 
-        # ★ランダムなホワイトノイズを生成 (実行時に生成)
-        # Lambda内でshapeを取得して生成する
         random_noise = tf.keras.layers.Lambda(
             lambda shape_tensor: tf.random.normal(tf.shape(shape_tensor))
         )(noise_env)
 
-        # エンベロープ × ホワイトノイズ
         output = noise_env * random_noise
 
         return tf.squeeze(output, axis=-1)
