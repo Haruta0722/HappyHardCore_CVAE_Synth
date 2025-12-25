@@ -19,7 +19,7 @@ def check_dataset_quality(dataset):
     acid_samples = []
     pluck_samples = []
 
-    for wave, cond in dataset[:100]:  # 最初の100サンプル
+    for wave, cond in dataset.take[:100]:  # 最初の100サンプル
         pitch, s, a, p = cond
 
         # 主要なラベルを判定
