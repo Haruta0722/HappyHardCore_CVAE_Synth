@@ -132,13 +132,16 @@ def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
 
     # 埋め込み
     pitch_embed_layer = PitchEmbedding(embed_dim=32)
-    pitch_embed = tf.squeeze(pitch_embed_layer(pitch), axis=1)
+    pitch_embed = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=1))(
+        pitch_embed_layer(pitch)
+    )
 
     timbre_embed_layer = TimbreEmbedding(embed_dim=64)
     timbre_embed = timbre_embed_layer(timbre)
 
-    full_cond = tf.concat([pitch_embed, timbre_embed], axis=-1)  # (B, 96)
-
+    full_cond = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
+        [pitch_embed, timbre_embed]
+    )
     x = x_in
 
     for i, (ch, k, s) in enumerate(channels):
@@ -161,7 +164,9 @@ def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         padding="same",
         bias_initializer=tf.keras.initializers.Constant(-3.0),
     )(x)
-    z_logvar = tf.clip_by_value(z_logvar, -10.0, 2.0)
+    z_logvar = tf.keras.layers.Lambda(
+        lambda x: tf.clip_by_value(x, -10.0, 2.0)
+    )(z_logvar)
 
     return tf.keras.Model([x_in, cond], [z_mean, z_logvar], name="encoder")
 
@@ -181,19 +186,27 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
 
     # 埋め込み
     pitch_embed_layer = PitchEmbedding(embed_dim=32)
-    pitch_embed = tf.squeeze(pitch_embed_layer(pitch), axis=1)
+    pitch_embed = tf.keras.layers.Lambda(lambda x: tf.squeeze(x, axis=1))(
+        pitch_embed_layer(pitch)
+    )
 
     timbre_embed_layer = TimbreEmbedding(embed_dim=64)
     timbre_embed = timbre_embed_layer(timbre)
 
-    full_cond = tf.concat([pitch_embed, timbre_embed], axis=-1)
+    full_cond = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
+        [pitch_embed, timbre_embed]
+    )
 
     x = z_in
 
     # ★新機能: 条件情報を最初に注入
     # 潜在変数と条件を結合してから展開
-    cond_broadcast = tf.tile(full_cond[:, None, :], [1, LATENT_STEPS, 1])
-    x = tf.concat([x, cond_broadcast], axis=-1)
+    cond_broadcast = tf.keras.layers.Lambda(
+        lambda x: tf.tile(x[:, None, :], [1, LATENT_STEPS, 1])
+    )(full_cond)
+    x = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
+        [x, cond_broadcast]
+    )
     x = tf.keras.layers.Conv1D(latent_dim, 3, padding="same")(x)
 
     for i, (ch, k, s) in enumerate(reversed(channels)):
@@ -210,8 +223,13 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         x = tf.keras.layers.LeakyReLU(0.2)(x)
 
     # ★改善: 最終層でも条件を反映
-    x = tf.concat(
-        [x, tf.tile(full_cond[:, None, :], [1, TIME_LENGTH, 1])], axis=-1
+    x = tf.keras.layers.Lambda(lambda x: tf.concat(x, axis=-1))(
+        [
+            x,
+            tf.keras.layers.Lambda(
+                lambda x: tf.tile(x[:, None, :], [1, TIME_LENGTH, 1])
+            )(full_cond),
+        ]
     )
     x = tf.keras.layers.Conv1D(64, 7, padding="same", activation="relu")(x)
     out = tf.keras.layers.Conv1D(1, 15, padding="same", activation="tanh")(x)
@@ -265,7 +283,9 @@ class TimeWiseCVAE(tf.keras.Model):
         step = tf.cast(self.optimizer.iterations, tf.float32)
         warmup_done = tf.cast(step >= self.kl_warmup_steps, tf.float32)
         rampup_progress = (step - self.kl_warmup_steps) / self.kl_rampup_steps
-        rampup_progress = tf.clip_by_value(rampup_progress, 0.0, 1.0)
+        rampup_progress = tf.keras.layers.Lambda(
+            lambda x: tf.clip_by_value(x, 0.0, 1.0)
+        )(rampup_progress)
         return self.kl_target * rampup_progress * warmup_done
 
     def compute_free_bits_kl(self, z_mean, z_logvar):
