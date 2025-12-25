@@ -210,7 +210,7 @@ def build_encoder(latent_dim=LATENT_DIM):
         lambda x: tf.clip_by_value(x, -10.0, 2.0)
     )(z_logvar)
 
-    return tf.keras.Model([x_in], [z_mean, z_logvar], name="encoder")
+    return tf.keras.Model(x_in, [z_mean, z_logvar], name="encoder")
 
 
 def sample_z(z_mean, z_logvar):
@@ -317,7 +317,7 @@ class TimeWiseCVAE(tf.keras.Model):
         x, cond = data
 
         with tf.GradientTape() as tape:
-            z_mean, z_logvar = self.encoder(x)
+            z_mean, z_logvar = self.encoder([x, cond])
             z = sample_z(z_mean, z_logvar)
 
             x_hat = self.decoder([z, cond])
