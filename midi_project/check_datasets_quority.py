@@ -1,5 +1,6 @@
 import numpy as np
 import matplotlib.pyplot as plt
+import tensorflow as tf
 from scipy import signal
 import soundfile as sf
 from create_datasets import make_dataset_from_synth_csv
@@ -18,9 +19,10 @@ def check_dataset_quality(dataset):
     screech_samples = []
     acid_samples = []
     pluck_samples = []
+    dataset = dataset.unbatch()
 
     for wave, cond in dataset.take(100):  # 最初の100サンプル
-        pitch, s, a, p = cond
+        pitch, s, a, p = cond.numpy()
 
         # 主要なラベルを判定
         if s > 0.5:
@@ -44,9 +46,9 @@ def check_dataset_quality(dataset):
         return
 
     # 各ラベルの代表サンプル
-    screech_rep = screech_samples[0].squeeze()
-    acid_rep = acid_samples[0].squeeze()
-    pluck_rep = pluck_samples[0].squeeze()
+    screech_rep = screech_samples[0].numpy().squeeze()
+    acid_rep = acid_samples[0].numpy().squeeze()
+    pluck_rep = pluck_samples[0].numpy().squeeze()
 
     # スペクトログラム計算
     def compute_spectrum(wave):
