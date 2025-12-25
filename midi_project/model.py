@@ -189,9 +189,8 @@ channels = [
 LATENT_STEPS = TIME_LENGTH // 16
 
 
-def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
+def build_encoder(latent_dim=LATENT_DIM):
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1))
-    cond = tf.keras.Input(shape=(cond_dim,))
 
     x = x_in
 
@@ -207,7 +206,9 @@ def build_encoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         padding="same",
         bias_initializer=tf.keras.initializers.Constant(-3.0),
     )(x)
-    z_logvar = tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x, -10.0, 2.0))(z_logvar)
+    z_logvar = tf.keras.layers.Lambda(
+        lambda x: tf.clip_by_value(x, -10.0, 2.0)
+    )(z_logvar)
 
     return tf.keras.Model([x_in, cond], [z_mean, z_logvar], name="encoder")
 
@@ -316,7 +317,7 @@ class TimeWiseCVAE(tf.keras.Model):
         x, cond = data
 
         with tf.GradientTape() as tape:
-            z_mean, z_logvar = self.encoder([x, cond])
+            z_mean, z_logvar = self.encoder(x)
             z = sample_z(z_mean, z_logvar)
 
             x_hat = self.decoder([z, cond])
