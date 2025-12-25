@@ -10,6 +10,7 @@ from model import (
     diff_weight,
 )  # 強力な条件付けモデルをインポート
 import numpy as np
+import os
 from create_datasets import make_dataset_from_synth_csv
 
 
@@ -197,7 +198,9 @@ class ConditionMonitorCallback(tf.keras.callbacks.Callback):
 
 
 # 学習スクリプト
-def train_with_strong_conditioning(batch_size=16, epochs=200):
+def train_with_strong_conditioning(
+    batch_size=16, epochs=200, resume_checkpoint=True
+):
     """
     強力な条件付けモデルで学習
     """
@@ -236,6 +239,24 @@ def train_with_strong_conditioning(batch_size=16, epochs=200):
 
     model.compile(optimizer=tf.keras.optimizers.Adam(learning_rate=1e-4))
 
+    checkpoint_path = "checkpoints/best_model.weights.h5"
+    initial_epoch = 0
+    if resume_checkpoint and os.path.exists(checkpoint_path):
+        print(f"🔄  チェックポイントを発見: {checkpoint_path} から学習再開")
+        model.load_weights(checkpoint_path)
+        # CSVログから最後のepochを取得して再開epochを設定
+        import csv
+
+        if os.path.exists("training_log.csv"):
+            with open("training_log.csv", "r") as f:
+                reader = list(csv.reader(f))
+                if len(reader) > 1:
+                    last_epoch = int(reader[-1][0])
+                    initial_epoch = last_epoch + 1
+                    print(f"  CSVログより初期エポックを {initial_epoch} に設定")
+    else:
+        print("🆕  新規学習を開始します")
+
     print(f"  エンコーダー: {model.encoder.count_params():,} パラメータ")
     print(f"  デコーダー: {model.decoder.count_params():,} パラメータ")
     print(f"  合計: {model.count_params():,} パラメータ")
@@ -250,9 +271,6 @@ def train_with_strong_conditioning(batch_size=16, epochs=200):
     )
     print(f"  KL Target: {model.kl_target}")
     print(f"  Free Bits: {model.free_bits}")
-
-    # monitorディレクトリ作成
-    import os
 
     os.makedirs("monitor", exist_ok=True)
     os.makedirs("checkpoints", exist_ok=True)
@@ -290,6 +308,7 @@ def train_with_strong_conditioning(batch_size=16, epochs=200):
         epochs=epochs,
         callbacks=callbacks,
         steps_per_epoch=steps_per_epoch,
+        initial_epoch=initial_epoch,
         verbose=1,
     )
 
