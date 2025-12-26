@@ -16,44 +16,109 @@ STFT_weight = 15.0
 mel_weight = 10.0
 kl_weight = 0.0005
 
+channels = [
+    (64, 5, 4),
+    (128, 5, 4),
+    (256, 5, 2),
+    (512, 3, 2),
+]
 
-class GenerateHarmonicWave(tf.keras.layers.Layer):
-    def __init__(self, length=None, sr=SR):
+LATENT_STEPS = TIME_LENGTH // 64
+
+
+class TimbreShaper(tf.keras.layers.Layer):
+    """
+    ★新機能: 音色ごとに倍音バランスを明示的に変える
+    """
+
+    def __init__(self, num_harmonics=NUM_HARMONICS):
         super().__init__()
-        self.length = length
+        self.num_harmonics = num_harmonics
+
+        # 各音色の倍音プロファイルを学習
+        self.screech_profile = tf.keras.layers.Dense(
+            num_harmonics, activation="sigmoid", name="screech_profile"
+        )
+        self.acid_profile = tf.keras.layers.Dense(
+            num_harmonics, activation="sigmoid", name="acid_profile"
+        )
+        self.pluck_profile = tf.keras.layers.Dense(
+            num_harmonics, activation="sigmoid", name="pluck_profile"
+        )
+
+    def call(self, base_amps, timbre_weights):
+        """
+        Args:
+            base_amps: (B, T, H) - 基本的な倍音振幅
+            timbre_weights: (B, 3) - [screech, acid, pluck]
+
+        Returns:
+            shaped_amps: (B, T, H) - 音色で調整された倍音振幅
+        """
+        # 各音色のプロファイル
+        screech_w = timbre_weights[:, 0:1]  # (B, 1)
+        acid_w = timbre_weights[:, 1:2]
+        pluck_w = timbre_weights[:, 2:3]
+
+        # プロファイルを生成（重みから）
+        screech_prof = self.screech_profile(screech_w)  # (B, H)
+        acid_prof = self.acid_profile(acid_w)
+        pluck_prof = self.pluck_profile(pluck_w)
+
+        # 重み付き合成
+        combined_profile = (
+            screech_prof * screech_w + acid_prof * acid_w + pluck_prof * pluck_w
+        )  # (B, H)
+
+        # 時間方向に展開
+        combined_profile = combined_profile[:, None, :]  # (B, 1, H)
+
+        # base_ampsに音色プロファイルを適用
+        shaped_amps = base_amps * (0.5 + combined_profile * 1.5)
+
+        return shaped_amps
+
+
+class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
+    """
+    ★改善: 時間変化する倍音振幅に対応
+    """
+
+    def __init__(self, sr=SR):
+        super().__init__()
         self.sr = sr
 
     def call(self, inputs):
-        fundamental_freq, amplitudes, phases = inputs
+        fundamental_freq, amplitudes_time, phases = inputs
+        # amplitudes_time: (B, T, H) - 時間変化する倍音振幅
+        # phases: (B, H) - 初期位相
 
-        # ★軽量化1: tf.tileを削除し、ブロードキャストを利用する
-        # 時間軸 t: (1, T, 1)
-        t = tf.range(self.length, dtype=tf.float32) / float(self.sr)
-        t = t[None, :, None]
+        batch_size = tf.shape(fundamental_freq)[0]
+        time_length = tf.shape(amplitudes_time)[1]
+        num_harmonics = tf.shape(amplitudes_time)[2]
 
-        # f0: (B, 1, 1)
-        f0 = fundamental_freq[:, None, None]
+        # 時間軸
+        t = tf.cast(tf.range(time_length), tf.float32) / float(self.sr)
+        t = tf.reshape(t, [1, -1, 1])  # (1, T, 1)
 
-        # 倍音番号: (1, 1, H)
-        num_harmonics = tf.shape(amplitudes)[1]
-        harmonic_nums = tf.range(1, num_harmonics + 1, dtype=tf.float32)[
-            None, None, :
-        ]
+        # 基本周波数
+        f0 = tf.reshape(fundamental_freq, [-1, 1, 1])  # (B, 1, 1)
 
-        # 角周波数: (B, 1, H)
-        omega = 2.0 * np.pi * f0 * harmonic_nums
+        # 倍音番号
+        harmonic_nums = tf.cast(tf.range(1, num_harmonics + 1), tf.float32)
+        harmonic_nums = tf.reshape(harmonic_nums, [1, 1, -1])  # (1, 1, H)
 
-        # 振幅と位相: (B, T, H) になるように後でブロードキャストされる
-        amps = amplitudes[
-            :, None, :
-        ]  # 実際はDecoder側で時間方向に展開済みなら (B, T, H)
-        phas = phases[:, None, :]
+        # 角周波数
+        omega = 2.0 * np.pi * f0 * harmonic_nums  # (B, 1, H)
 
-        # ★ここが最大の計算量。ブロードキャストでメモリを節約しながら計算
-        # t (1, T, 1) * omega (B, 1, H) -> (B, T, H) が自動的に行われる
-        harmonics = amps * tf.sin(omega * t + phas)
+        # 位相を展開
+        phas = tf.reshape(phases, [-1, 1, num_harmonics])  # (B, 1, H)
 
-        wave = tf.reduce_sum(harmonics, axis=-1)
+        # ★重要: 時間変化する振幅を使用
+        # amplitudes_time は既に (B, T, H)
+        harmonics = amplitudes_time * tf.sin(omega * t + phas)
+
+        wave = tf.reduce_sum(harmonics, axis=-1)  # (B, T)
 
         return wave
 
@@ -80,7 +145,6 @@ class EnvelopeNet(tf.keras.layers.Layer):
     def call(self, z):
         x = self.net(z)
 
-        # 修正: 同様に4次元経由でリサイズ
         x = tf.keras.layers.Lambda(
             lambda v: tf.squeeze(
                 tf.image.resize(
@@ -91,6 +155,7 @@ class EnvelopeNet(tf.keras.layers.Layer):
                 axis=2,
             )
         )(x)
+
         return tf.squeeze(x, axis=-1)
 
 
@@ -100,8 +165,12 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
         self.num_harmonics = num_harmonics
         self.output_length = output_length
 
+        # ★改善: より深いネットワークで複雑な倍音パターンを学習
         self.net = tf.keras.Sequential(
             [
+                tf.keras.layers.Conv1D(
+                    128, 5, padding="same", activation="relu"
+                ),
                 tf.keras.layers.Conv1D(
                     128, 5, padding="same", activation="relu"
                 ),
@@ -121,10 +190,8 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        amps = self.net(z_cond)  # (B, T_low, H)
+        amps = self.net(z_cond)
 
-        # 修正: 4次元に拡張してからリサイズし、3次元に戻す
-        # (B, T, H) -> (B, T, 1, H) -> resize -> (B, Output_T, 1, H) -> (B, Output_T, H)
         amps = tf.keras.layers.Lambda(
             lambda v: tf.squeeze(
                 tf.image.resize(
@@ -136,15 +203,24 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
             )
         )(amps)
 
-        return amps
+        return amps  # (B, T, H)
 
 
 class NoiseGenerator(tf.keras.layers.Layer):
+    """
+    ★改善: より表現力のあるノイズ生成
+    """
+
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
-        self.net = tf.keras.Sequential(
+
+        # ノイズのエンベロープを生成
+        self.envelope_net = tf.keras.Sequential(
             [
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
                 tf.keras.layers.Conv1D(
                     32, 5, padding="same", activation="relu"
                 ),
@@ -154,14 +230,26 @@ class NoiseGenerator(tf.keras.layers.Layer):
             ]
         )
 
+        # ノイズのフィルタリング（周波数特性）
+        self.filter_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    32, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    16, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(1, 5, padding="same", activation="tanh"),
+            ]
+        )
+
     def call(self, z, cond):
         latent_steps = tf.shape(z)[1]
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        noise_env = self.net(z_cond)
-
-        # 修正: 同様に4次元経由でリサイズ
+        # ノイズのエンベロープ
+        noise_env = self.envelope_net(z_cond)
         noise_env = tf.keras.layers.Lambda(
             lambda v: tf.squeeze(
                 tf.image.resize(
@@ -173,27 +261,17 @@ class NoiseGenerator(tf.keras.layers.Layer):
             )
         )(noise_env)
 
-        random_noise = tf.keras.layers.Lambda(
-            lambda shape_tensor: tf.random.normal(tf.shape(shape_tensor))
-        )(noise_env)
+        # ホワイトノイズ生成
+        batch_size = tf.shape(z)[0]
+        random_noise = tf.random.normal([batch_size, self.output_length, 1])
 
-        output = noise_env * random_noise
+        # ノイズのフィルタリング
+        filtered_noise = self.filter_net(random_noise)
+
+        # エンベロープを適用
+        output = noise_env * filtered_noise
 
         return tf.squeeze(output, axis=-1)
-
-
-# ★軽量化4: Encoderのストライドを変更して、潜在変数の時間方向を圧縮
-# 以前: [2, 2, 2, 2] = 16倍圧縮 (Latent長 3900)
-# 今回: [4, 4, 2, 2] = 64倍圧縮 (Latent長 975) -> これでも十分高精細
-channels = [
-    (64, 5, 4),  # Stride 4
-    (128, 5, 4),  # Stride 4
-    (256, 5, 2),  # Stride 2
-    (512, 3, 2),  # Stride 2
-]
-
-# 64倍圧縮に合わせたLatent Steps
-LATENT_STEPS = TIME_LENGTH // 64
 
 
 def build_encoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM):
@@ -231,51 +309,57 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # 各生成モジュール (潜在変数が短くなったので計算が高速)
+    # 倍音振幅生成（時間変化あり）
     harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
-    # (B, T, H) ここでresize済み
-    harmonic_amps_time = harmonic_amp_net(z_in, cond)
+    base_harmonic_amps = harmonic_amp_net(z_in, cond)  # (B, T, H)
 
+    # ★新機能: 音色による倍音シェーピング
+    timbre = tf.keras.layers.Lambda(lambda c: c[:, 1:])(cond)
+    timbre_shaper = TimbreShaper(num_harmonics=NUM_HARMONICS)
+    shaped_harmonic_amps = timbre_shaper(
+        base_harmonic_amps, timbre
+    )  # (B, T, H)
+
+    # エンベロープ生成
     envelope_net = EnvelopeNet()
     envelope = envelope_net(z_in)  # (B, T)
 
+    # ノイズ生成
     noise_gen = NoiseGenerator()
-    noise = noise_gen(z_in, cond)  # (B, T) - エンベロープ方式で生成されたノイズ
+    noise = noise_gen(z_in, cond)  # (B, T)
 
-    # Pitch計算
+    # 基本周波数
     pitch = tf.keras.layers.Lambda(lambda c: c[:, 0])(cond)
     fundamental_freq = tf.keras.layers.Lambda(
         lambda p: 440.0 * tf.pow(2.0, ((p * 35.0 + 36.0) - 69.0) / 12.0)
     )(pitch)
 
-    # 倍音振幅 (時間変化あり)
-    # 元のコードに合わせて reduce_mean していますが、
-    # 時間変化を生かしたいなら harmonic_amps_time をそのまま使ってもOKです。
-    # 今回は元のロジックに従い平均化します。
-    avg_harmonic_amps = tf.keras.layers.Lambda(
-        lambda x: tf.reduce_mean(x, axis=1)
-    )(harmonic_amps_time)
-
-    # 以前は (B, H) でしたが、generate_harmonic_wave 内でブロードキャストさせるため
-    # ここでの処理はそのまま (B, H) でOK。
-    # ただし、時間変化させたい場合は (B, T, H) のまま渡すようにLayerを改造できます。
-    # ここでは「同じ結果」を出すため、あえて平均化されたものを使います。
-
-    phases = tf.keras.layers.Lambda(lambda x: tf.zeros_like(x))(
-        avg_harmonic_amps
+    # 初期位相（時間軸の最初の倍音振幅から推定）
+    initial_amps = tf.keras.layers.Lambda(lambda x: x[:, 0, :])(
+        shaped_harmonic_amps
     )
+    phases = tf.keras.layers.Lambda(lambda x: tf.zeros_like(x))(initial_amps)
 
-    # 倍音合成
-    harmonic_wave_layer = GenerateHarmonicWave(length=TIME_LENGTH)
+    # ★改善: 時間変化する倍音合成
+    harmonic_wave_layer = GenerateHarmonicWaveTimeVarying()
     harmonic_wave = harmonic_wave_layer(
-        [fundamental_freq, avg_harmonic_amps, phases]
+        [fundamental_freq, shaped_harmonic_amps, phases]
     )
 
-    timbre = tf.keras.layers.Lambda(lambda c: c[:, 1:])(cond)
+    # ★改善: 音色によって倍音/ノイズの比率を動的に変える
+    screech_w = tf.keras.layers.Lambda(lambda c: c[:, 1:2])(cond)
+    acid_w = tf.keras.layers.Lambda(lambda c: c[:, 2:3])(cond)
+    pluck_w = tf.keras.layers.Lambda(lambda c: c[:, 3:4])(cond)
 
-    harmonic_ratio = 0.9
-    noise_ratio = 0.1
+    # screech: ノイズ強め (0.5), 倍音も強い
+    # acid: バランス (0.2)
+    # pluck: ノイズ弱め (0.05), 倍音中心
+    noise_ratio = screech_w * 0.5 + acid_w * 0.2 + pluck_w * 0.05
+    harmonic_ratio = (
+        1.0 - noise_ratio * 0.5
+    )  # ノイズが増えても倍音は減らしすぎない
 
+    # 最終合成
     output = harmonic_wave * envelope * harmonic_ratio + noise * noise_ratio
 
     output = tf.keras.layers.Activation("tanh")(output)
@@ -292,7 +376,6 @@ class TimeWiseCVAE(tf.keras.Model):
         self.encoder = build_encoder(latent_dim, cond_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
 
-        # 学習パラメータ等は変更なし
         self.steps_per_epoch = steps_per_epoch
         self.kl_warmup_epochs = 20
         self.kl_rampup_epochs = 50
@@ -325,6 +408,7 @@ class TimeWiseCVAE(tf.keras.Model):
 
     def train_step(self, data):
         x, cond = data
+
         with tf.GradientTape() as tape:
             z_mean, z_logvar = self.encoder([x, cond])
             z = sample_z(z_mean, z_logvar)
@@ -343,6 +427,7 @@ class TimeWiseCVAE(tf.keras.Model):
             )
 
             kl_weight = self.compute_kl_weight()
+
             loss = (
                 recon * recon_weight
                 + stft_loss * STFT_weight
