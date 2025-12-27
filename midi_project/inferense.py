@@ -2,6 +2,7 @@ import soundfile as sf
 import tensorflow as tf
 import numpy as np
 from model import TimeWiseCVAE, LATENT_STEPS, LATENT_DIM, TIME_LENGTH
+from create_datasets import load_wav, crop_or_pad
 
 
 def inference_random_z(
@@ -69,23 +70,28 @@ def inference_from_reference(
     print(f"\n[生成] 参照ベース")
     print(f"  pitch={pitch} (MIDI), cond={cond}")
 
-    # 参照波形
     if reference_wave is None:
         # シンプルな正弦波を生成
         t = np.arange(TIME_LENGTH) / 48000.0
         freq = 440.0 * 2 ** ((pitch - 69.0) / 12.0)
         reference_wave = 0.5 * np.sin(2 * np.pi * freq * t)
         reference_wave = reference_wave[:, None].astype(np.float32)
+    else:
+        # ★ここに追加: 外部から渡された波形が1次元の場合、(Time, 1)の形状に変換する
+        reference_wave = np.array(reference_wave, dtype=np.float32)  # 型を保証
+        if reference_wave.ndim == 1:
+            reference_wave = reference_wave[:, None]
 
     # 条件ベクトル
     pitch_norm = (pitch - 36.0) / 35.0
     cond_vector = tf.constant([[pitch_norm, *cond]], dtype=tf.float32)
 
     # 参照からzを抽出
+    # ここでの [None, :, :] は reference_wave が2次元 (Time, Channels) であることを前提としています
     reference_wave_batch = tf.constant(
         reference_wave[None, :, :], dtype=tf.float32
     )
-    z_mean, z_logvar = model.encoder(reference_wave_batch)
+    z_mean, z_logvar = model.encoder([reference_wave_batch, cond_vector])
     z = z_mean  # 平均値を使用
 
     # 生成
@@ -252,7 +258,7 @@ def diagnose_model(model):
 
     for i in range(20):
         wave = dummy_waves[i : i + 1]
-        z_mean, z_logvar = model.encoder(wave, cond_dim)
+        z_mean, z_logvar = model.encoder([wave, cond_dim])
         z_means.append(z_mean.numpy())
         z_logvars.append(z_logvar.numpy())
 
@@ -296,7 +302,7 @@ def main():
     dummy_cond = tf.zeros((1, 4))
     _ = model((dummy_x, dummy_cond), training=False)
 
-    ckpt_path = "checkpoints/best_model.weights.h5"
+    ckpt_path = "weights/epoch_200.weights.h5"
     model.load_weights(ckpt_path)
     print(f"✓ モデルの重みを読み込みました: {ckpt_path}")
 
@@ -319,8 +325,14 @@ def main():
         output_name="test_random.wav",
     )
     inference_zero_z(pitch, cond, model, output_name="test_zero.wav")
+    reference = load_wav("datasets/C4/0013.wav")
+    reference = crop_or_pad(reference, TIME_LENGTH)
     inference_from_reference(
-        pitch, cond, model, output_name="test_reference.wav"
+        pitch,
+        cond,
+        model,
+        reference_wave=reference,
+        output_name="test_reference.wav",
     )
 
     # 詳細テスト

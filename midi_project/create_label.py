@@ -6,10 +6,7 @@ BASE_DIR = Path("datasets")
 OUT_CSV = "dataset.csv"
 
 # C2(36) 〜 B4(71)
-notes = [
-    "C", "C#", "D", "D#", "E",
-    "F", "F#", "G", "G#", "A", "A#", "B"
-]
+notes = ["C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B"]
 
 note_to_pitch = {}
 pitch = 36
@@ -27,31 +24,32 @@ rows = []
 for folder, pitch_value in note_to_pitch.items():
     folder_path = BASE_DIR / folder
 
-    for i in range(1, 40):  # 0001.wav ～ 0039.wav
+    for i in range(1, 37):  # 0001.wav ～ 0039.wav
         fname = f"{i:04d}.wav"
         wav_path = folder_path / fname
 
         screech = acid = pluck = 0
-        if 1 <= i <= 13:
+        if 1 <= i <= 11:
             screech = 1
-        elif 14 <= i <= 26:
+        elif 12 <= i <= 23:
             acid = 1
-        elif 27 <= i <= 39:
+        elif 24 <= i <= 36:
             pluck = 1
 
-        rows.append({
-            "path": str(wav_path),
-            "pitch": pitch_value,
-            "screech": screech,
-            "acid": acid,
-            "pluck": pluck
-        })
+        rows.append(
+            {
+                "path": str(wav_path),
+                "pitch": pitch_value,
+                "screech": screech,
+                "acid": acid,
+                "pluck": pluck,
+            }
+        )
 
 # ===== 書き込み =====
 with open(OUT_CSV, "w", newline="", encoding="utf-8") as f:
     writer = csv.DictWriter(
-        f,
-        fieldnames=["path", "pitch", "screech", "acid", "pluck"]
+        f, fieldnames=["path", "pitch", "screech", "acid", "pluck"]
     )
     writer.writeheader()
     writer.writerows(rows)
