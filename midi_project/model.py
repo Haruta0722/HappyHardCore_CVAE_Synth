@@ -59,8 +59,10 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         decay_rate = self.decay_net(timbre_weights)  # (B, 1)
 
         # 時間軸を生成
-        time_length = tf.shape(base_envelope)[1]
-        t = tf.cast(tf.range(time_length), tf.float32) / float(time_length)
+        time_length = tf.shape(base_envelope)[1]  # SymbolicTensor
+        t = tf.cast(tf.range(time_length), tf.float32) / tf.cast(
+            time_length, tf.float32
+        )
         t = t[None, :]  # (1, T)
 
         # 減衰カーブを生成
@@ -150,7 +152,7 @@ class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
 
     def __init__(self, sr=SR):
         super().__init__()
-        self.sr = sr
+        self.sr = float(sr)
 
     def call(self, inputs):
         fundamental_freq, amplitudes_time, phases = inputs
