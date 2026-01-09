@@ -59,6 +59,34 @@ def mel_l1(S_mag, S_hat_mag, n_fft=1024, hop=256, n_mels=MEL_BINS, eps=1e-7):
     return tf.reduce_mean(tf.abs(tf.math.log(mel) - tf.math.log(mel_hat)))
 
 
+def mel_kl(S_mag, S_hat_mag, n_fft=1024, hop=256, n_mels=MEL_BINS, eps=1e-7):
+
+    # mel 行列は固定
+    mel_mat = tf.stop_gradient(
+        tf.cast(get_mel_matrix(n_fft, n_mels=n_mels), S_mag.dtype)
+    )
+
+    mel = tf.matmul(S_mag, mel_mat)
+    mel_hat = tf.matmul(S_hat_mag, mel_mat)
+
+    mel = tf.maximum(mel, eps)
+    mel_hat = tf.maximum(mel_hat, eps)
+
+    # フレームごとに正規化（分布化）
+    mel_sum = tf.reduce_sum(mel, axis=-1, keepdims=True)
+    mel_hat_sum = tf.reduce_sum(mel_hat, axis=-1, keepdims=True)
+
+    P = mel / mel_sum
+    Q = mel_hat / mel_hat_sum
+
+    # KL(P || Q)
+    kl = tf.reduce_sum(
+        P * (tf.math.log(P + eps) - tf.math.log(Q + eps)), axis=-1
+    )
+
+    return tf.reduce_mean(kl)
+
+
 def temporal_diff_l1(S_mag, S_hat_mag):
     dy = S_mag[:, 1:] - S_mag[:, :-1]
     dy_hat = S_hat_mag[:, 1:] - S_hat_mag[:, :-1]
@@ -97,3 +125,22 @@ def Loss(y, y_hat, fft_size, hop_size, eps=1e-7):
     diff_loss = temporal_diff_l1(S_mag, S_hat_mag)
 
     return stft_loss, mel_loss, diff_loss
+
+
+def Loss_for_test(y, y_hat, fft_size, hop_size, eps=1e-7):
+
+    S = tf.stop_gradient(
+        tf.signal.stft(
+            y, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size
+        )
+    )
+    S_hat = tf.signal.stft(
+        y_hat, frame_length=fft_size, frame_step=hop_size, fft_length=fft_size
+    )
+
+    S_mag = tf.maximum(tf.abs(S), eps)
+    S_hat_mag = tf.maximum(tf.abs(S_hat), eps)
+
+    mel_loss = mel_kl(S_mag, S_hat_mag, n_fft=fft_size, hop=hop_size)
+
+    return mel_loss
