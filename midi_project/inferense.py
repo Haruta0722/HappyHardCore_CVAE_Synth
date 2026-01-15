@@ -40,62 +40,6 @@ def inference_zero_z(
     return x_hat
 
 
-def inference_from_reference(
-    pitch: float,
-    cond: tuple[float, float, float],
-    model,
-    reference_wave=None,
-    output_name="generated_ref.wav",
-):
-    """
-    ★改善版: 参照音声から潜在変数を抽出して生成
-    エンベロープの時間変化もzに反映されるようになった
-    """
-    print(f"\n[生成] 参照ベース（改善版）")
-    print(f"  pitch={pitch} (MIDI), cond={cond}")
-
-    if reference_wave is None:
-        t = np.arange(TIME_LENGTH) / 48000.0
-        freq = 440.0 * 2 ** ((pitch - 69.0) / 12.0)
-        reference_wave = 0.5 * np.sin(2 * np.pi * freq * t)
-        reference_wave = reference_wave[:, None].astype(np.float32)
-    else:
-        reference_wave = np.array(reference_wave, dtype=np.float32)
-        if reference_wave.ndim == 1:
-            reference_wave = reference_wave[:, None]
-
-    # 条件ベクトル
-    pitch_norm = (pitch - 36.0) / 35.0
-    cond_vector = tf.constant([[pitch_norm, *cond]], dtype=tf.float32)
-
-    # 参照からzを抽出
-    reference_wave_batch = tf.constant(
-        reference_wave[None, :, :], dtype=tf.float32
-    )
-    z_mean, z_logvar = model.encoder([reference_wave_batch, cond_vector])
-
-    # ★重要: 平均値だけでなく、適度なランダム性も加える
-    # これにより、エンベロープの微妙な変化も再現される
-    z = (
-        z_mean
-        + tf.exp(0.5 * z_logvar) * tf.random.normal(tf.shape(z_mean)) * 0.1
-    )
-
-    # 生成
-    x_hat = model.decoder([z, cond_vector])
-    x_hat = tf.squeeze(x_hat).numpy()
-
-    # 正規化
-    max_val = np.max(np.abs(x_hat))
-    if max_val > 1e-6:
-        x_hat = x_hat / max_val * 0.95
-
-    sf.write(output_name, x_hat, samplerate=48000)
-    print(f"  ✓ 保存: {output_name} (max_amp={max_val:.4f})")
-
-    return x_hat
-
-
 def inference_random_z(
     pitch: float,
     cond: tuple[float, float, float],
@@ -125,53 +69,6 @@ def inference_random_z(
     print(f"  ✓ 保存: {output_name} (max_amp={max_val:.4f})")
 
     return x_hat
-
-
-def test_envelope_learning(model, reference_files, output_dir="envelope_test"):
-    """
-    ★新機能: エンベロープ学習のテスト
-    異なる参照音を使って、エンベロープが正しく再現されるか確認
-    """
-    import os
-
-    os.makedirs(output_dir, exist_ok=True)
-
-    print("\n" + "=" * 60)
-    print("エンベロープ学習テスト")
-    print("=" * 60)
-
-    for ref_file in reference_files:
-        print(f"\n参照: {ref_file}")
-
-        # 参照音声を読み込み
-        reference = load_wav(ref_file)
-        reference = crop_or_pad(reference, TIME_LENGTH)
-
-        # 音高を推定（簡易版）
-        # 実際にはより正確な音高推定が必要
-        pitch = 60  # C4
-
-        # 各音色で生成
-        for timbre_name, cond in [
-            ("pluck", (0, 0, 1)),
-            ("screech", (1, 0, 0)),
-            ("acid", (0, 1, 0)),
-        ]:
-            output_name = os.path.join(
-                output_dir,
-                f"{os.path.basename(ref_file).replace('.wav', 'epoch_137e_name}.wav')}",
-            )
-
-            inference_from_reference(
-                pitch,
-                cond,
-                model,
-                reference_wave=reference,
-                output_name=output_name,
-            )
-
-    print("\n✓ エンベロープテスト完了")
-    print(f"  結果: {output_dir}/")
 
 
 def compare_envelope_shapes(model, pitch=60, output_dir="envelope_comparison"):
@@ -312,8 +209,6 @@ def diagnose_model(model):
 
 
 def main():
-    reference = load_wav("datasets/C3/0013.wav")
-    reference = crop_or_pad(reference, TIME_LENGTH)
     print("=" * 60)
     print("DDSP風モデル 推論スクリプト（改善版）")
     print("=" * 60)
@@ -350,15 +245,6 @@ def main():
             model,
             temperature=recommended_temp,
             output_name=f"test_{timbre_name}_random.wav",
-        )
-
-        # 参照ベース（正弦波から）
-        inference_from_reference(
-            pitch,
-            cond,
-            model,
-            reference_wave=reference,
-            output_name=f"test_{timbre_name}_ref.wav",
         )
 
     print("\n[4] エンベロープ形状比較...")
