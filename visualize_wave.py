@@ -3,8 +3,8 @@ import matplotlib.pyplot as plt
 import librosa
 import librosa.display
 
-gen_path = "BigVGAN/y1.wav"  # 生成音
-ref_path = "datasets/input_data/0013.wav"  # 教師データ
+gen_path = "midi_project/test_pluck_random.wav"  # 生成音
+ref_path = "midi_project/envelope_comparison/acid.wav"  # 教師データ
 
 # 読み込み
 y_gen, sr_gen = librosa.load(gen_path, sr=None, mono=True)
