@@ -220,7 +220,7 @@ def main():
     dummy_cond = tf.zeros((1, 4))
     _ = model((dummy_x, dummy_cond), training=False)
 
-    ckpt_path = "weights/epoch_137.weights.h5"
+    ckpt_path = "weights/best_model.weights.h5"
     model.load_weights(ckpt_path)
     print(f"✓ モデルの重みを読み込みました: {ckpt_path}")
 

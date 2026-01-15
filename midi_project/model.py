@@ -27,30 +27,24 @@ LATENT_STEPS = TIME_LENGTH // 64
 
 class TimbreEnvelopeShaper(tf.keras.layers.Layer):
     """
-    ★改善: condから直接音色特性を学習し、zは変調のみに使用
+    ★改善: zとcondの両方を使い、バランスよく音色を生成
+    condは音色の「方向性」、zは「詳細な表現」を担当
     """
 
     def __init__(self):
         super().__init__()
 
-        # 各音色の基本的な減衰パターン（condから直接生成）
-        self.timbre_decay_net = tf.keras.Sequential(
+        # condとzを統合して処理
+        self.integrated_net = tf.keras.Sequential(
             [
+                tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
                 tf.keras.layers.Dense(16, activation="relu"),
                 tf.keras.layers.Dense(3, activation="sigmoid"),
             ]
         )
 
-        # zによる変調量（小さな調整のみ）
-        self.z_modulation_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(16, activation="relu"),
-                tf.keras.layers.Dense(3, activation="tanh"),  # -1~1の変調
-            ]
-        )
-
-        # acid用: うねり（LFO）パラメータ
+        # acid用: LFOパラメータ
         self.lfo_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(16, activation="relu"),
@@ -59,35 +53,32 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         )
 
     def call(self, base_envelope, timbre_weights, z_envelope_features):
-        # ★改善1: 音色から直接エンベロープパラメータを生成
-        env_params = self.timbre_decay_net(timbre_weights)
+        # ★重要: zとcondを結合（どちらも重要）
+        combined_input = tf.concat(
+            [timbre_weights, z_envelope_features], axis=-1
+        )
 
-        # pluckの影響を強化: pluck_weightが高いほど急速減衰
+        # 統合されたエンベロープパラメータを生成
+        env_params = self.integrated_net(combined_input)
+
         pluck_w = timbre_weights[:, 2:3]
-        attack_speed = env_params[:, 0:1] * 15.0 + 5.0 + pluck_w * 20.0
-        decay_rate = env_params[:, 1:2] * 10.0 + 5.0 + pluck_w * 15.0
-        sustain_level = env_params[:, 2:3] * 0.5 + 0.2 - pluck_w * 0.3
-
-        # screechの影響: 長い持続
         screech_w = timbre_weights[:, 0:1]
-        decay_rate = decay_rate - screech_w * 8.0  # 減衰を遅く
-        sustain_level = sustain_level + screech_w * 0.4  # サステインを高く
-
-        # ★改善2: zによる小さな変調（±20%程度）
-        z_mod = self.z_modulation_net(z_envelope_features) * 0.2
-        attack_speed = attack_speed * (1.0 + z_mod[:, 0:1])
-        decay_rate = decay_rate * (1.0 + z_mod[:, 1:2])
-        sustain_level = tf.clip_by_value(
-            sustain_level * (1.0 + z_mod[:, 2:3]), 0.05, 0.95
-        )
-
-        # acid用: LFOパラメータ
         acid_w = timbre_weights[:, 1:2]
-        lfo_params = self.lfo_net(
-            tf.concat([acid_w, z_envelope_features[:, :8]], axis=-1)
-        )
-        lfo_rate = lfo_params[:, 0:1] * 6.0 + 3.0  # 3-9 Hz
-        lfo_depth = lfo_params[:, 1:2] * 0.5 * acid_w  # acidの重みに比例
+
+        # パラメータ生成（pluckの影響を控えめに）
+        attack_speed = env_params[:, 0:1] * 15.0 + 3.0 + pluck_w * 10.0
+        decay_rate = env_params[:, 1:2] * 8.0 + 2.0 + pluck_w * 5.0
+        sustain_level = env_params[:, 2:3] * 0.6 + 0.2
+
+        # screechの影響（控えめに）
+        decay_rate = decay_rate - screech_w * 4.0
+        sustain_level = sustain_level + screech_w * 0.25
+
+        # acid用: LFOパラメータ（z特徴も使用）
+        lfo_input = tf.concat([combined_input], axis=-1)
+        lfo_params = self.lfo_net(lfo_input)
+        lfo_rate = lfo_params[:, 0:1] * 5.0 + 3.0  # 3-8 Hz
+        lfo_depth = lfo_params[:, 1:2] * 0.35 * acid_w
 
         # 時間軸を生成
         time_length = tf.shape(base_envelope)[1]
@@ -96,11 +87,9 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         )
         t = t[None, :]
 
-        # ★改善3: より明確なADSRエンベロープ
-        # pluckの場合: attack 5%, decay 30%, release 65%
-        # それ以外: attack 10%, decay 20%, sustain+release 70%
-        attack_ratio = 0.05 + (1.0 - pluck_w) * 0.05
-        decay_ratio = 0.30 * pluck_w + 0.20 * (1.0 - pluck_w)
+        # ADSRエンベロープ（シンプルに）
+        attack_ratio = 0.08 + pluck_w * 0.02
+        decay_ratio = 0.25
 
         attack_mask = tf.cast(t < attack_ratio, tf.float32)
         attack_curve = (t / (attack_ratio + 1e-6)) ** (1.0 / attack_speed)
@@ -114,8 +103,7 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
 
         release_mask = tf.cast(t >= decay_end, tf.float32)
         release_t = (t - decay_end) / (1.0 - decay_end + 1e-6)
-        # pluckの場合は速い減衰、それ以外は緩やか
-        release_decay = decay_rate * (0.5 + pluck_w * 2.0)
+        release_decay = decay_rate * (0.8 + pluck_w * 1.5)
         release_curve = sustain_level * tf.exp(-release_decay * release_t)
 
         envelope_shape = (
@@ -124,92 +112,74 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
             + release_mask * release_curve
         )
 
-        # ★改善4: acid用のLFO変調を強化
+        # acid用: LFO変調
         t_seconds = t * WAV_LENGTH
         lfo_modulation = 1.0 + lfo_depth * tf.sin(
             2.0 * np.pi * lfo_rate * t_seconds
         )
-        modulated_envelope = envelope_shape * lfo_modulation
 
-        # base_envelopeとの混合比を調整（音色特性を優先）
-        shaped_envelope = (
-            envelope_shape * 0.7 + base_envelope * modulated_envelope * 0.3
-        )
+        # ★重要: base_envelopeとenvelope_shapeをバランスよく混合
+        # zの情報を多く保持しつつ、音色特性も反映
+        final_envelope = base_envelope * 0.5 + envelope_shape * 0.5
+        final_envelope = final_envelope * lfo_modulation
 
-        return shaped_envelope
+        return final_envelope
 
 
 class TimbreShaper(tf.keras.layers.Layer):
     """
-    ★改善: 音色ごとの明確な倍音プロファイルを定義
+    ★改善: zから生成した倍音に、音色の「色付け」を軽く加える
     """
 
     def __init__(self, num_harmonics=NUM_HARMONICS):
         super().__init__()
         self.num_harmonics = num_harmonics
 
-        # 各音色の固定的な倍音特性を学習
-        self.screech_profile = tf.keras.Sequential(
+        # zとcondを統合して倍音調整を生成
+        self.profile_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
                 tf.keras.layers.Dense(num_harmonics, activation="sigmoid"),
             ],
-            name="screech_profile",
-        )
-
-        self.acid_profile = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(num_harmonics, activation="sigmoid"),
-            ],
-            name="acid_profile",
-        )
-
-        self.pluck_profile = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(num_harmonics, activation="sigmoid"),
-            ],
-            name="pluck_profile",
+            name="profile_net",
         )
 
     def call(self, base_amps, timbre_weights):
+        # ★重要: 音色weightsから軽い調整のみ生成
+        profile = self.profile_net(timbre_weights)
+
         screech_w = timbre_weights[:, 0:1]
         acid_w = timbre_weights[:, 1:2]
         pluck_w = timbre_weights[:, 2:3]
 
-        # ★改善: 各音色のプロファイルを音色weightから直接生成
-        screech_prof = self.screech_profile(screech_w)  # (B, H)
-        acid_prof = self.acid_profile(acid_w)
-        pluck_prof = self.pluck_profile(pluck_w)
-
-        # ★screech: 高音域にノイジーな成分（但し過剰ではない）
         harmonic_indices = tf.range(1, self.num_harmonics + 1, dtype=tf.float32)
-        high_freq_emphasis = tf.pow(harmonic_indices / self.num_harmonics, 1.5)
-        high_freq_emphasis = tf.reshape(high_freq_emphasis, [1, -1])
-        screech_prof = screech_prof * (0.3 + high_freq_emphasis * 0.7)
 
-        # ★acid: 中音域（3-12倍音）を強調
+        # 各音色の倍音特性（控えめに）
+        # screech: 高音域を少し強調
+        high_freq_emphasis = tf.pow(harmonic_indices / self.num_harmonics, 1.2)
+        high_freq_emphasis = tf.reshape(high_freq_emphasis, [1, -1])
+        screech_adjustment = 1.0 + screech_w * (high_freq_emphasis - 1.0) * 0.3
+
+        # acid: 中音域を少し強調
         mid_freq_mask = tf.exp(-0.5 * ((harmonic_indices - 7.0) / 4.0) ** 2)
         mid_freq_mask = tf.reshape(mid_freq_mask, [1, -1])
-        acid_prof = acid_prof * (0.5 + mid_freq_mask * 1.5)
+        acid_adjustment = 1.0 + acid_w * mid_freq_mask * 0.4
 
-        # ★pluck: 低音域重視、高音域減衰
-        low_freq_emphasis = tf.exp(-harmonic_indices / 10.0)
+        # pluck: 高音域を少し減衰
+        low_freq_emphasis = tf.exp(-harmonic_indices / 12.0)
         low_freq_emphasis = tf.reshape(low_freq_emphasis, [1, -1])
-        pluck_prof = pluck_prof * (0.2 + low_freq_emphasis * 0.8)
+        pluck_adjustment = 1.0 + pluck_w * (low_freq_emphasis - 1.0) * 0.3
 
-        # 重み付き合成
-        combined_profile = (
-            screech_prof * screech_w + acid_prof * acid_w + pluck_prof * pluck_w
+        # 組み合わせ
+        timbre_adjustment = (
+            screech_adjustment * acid_adjustment * pluck_adjustment
         )
-        combined_profile = combined_profile[:, None, :]  # (B, 1, H)
+        timbre_adjustment = timbre_adjustment[:, None, :]  # (B, 1, H)
 
-        # base_ampsとの混合（音色特性を強く反映）
-        shaped_amps = base_amps * 0.3 + combined_profile * 0.7
+        # ★重要: base_ampsを主体に、軽く調整
+        profile = profile[:, None, :]
+        shaped_amps = base_amps * (0.7 + profile * 0.3) * timbre_adjustment
         shaped_amps = tf.clip_by_value(shaped_amps, 0.0, 1.0)
 
         return shaped_amps
@@ -241,23 +211,27 @@ class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
 
 class EnvelopeNet(tf.keras.layers.Layer):
     """
-    ★改善: zの影響を適度に抑える
+    ★改善: zからの情報生成を強化（元の設計を尊重）
     """
 
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
 
+        # zから時間変化を捉える（より深く）
         self.net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
                     128, 7, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
+                    128, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
                     64, 5, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
-                    32, 5, padding="same", activation="relu"
+                    32, 3, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
                     1, 3, padding="same", activation="sigmoid"
@@ -268,6 +242,7 @@ class EnvelopeNet(tf.keras.layers.Layer):
         self.global_feature_net = tf.keras.Sequential(
             [
                 tf.keras.layers.GlobalAveragePooling1D(),
+                tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
             ]
         )
@@ -297,6 +272,10 @@ class EnvelopeNet(tf.keras.layers.Layer):
 
 
 class HarmonicAmplitudeNet(tf.keras.layers.Layer):
+    """
+    ★改善: zからの倍音生成を強化
+    """
+
     def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
         super().__init__()
         self.num_harmonics = num_harmonics
@@ -305,7 +284,7 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
         self.net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
-                    128, 5, padding="same", activation="relu"
+                    128, 7, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
                     128, 5, padding="same", activation="relu"
@@ -314,7 +293,7 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
                     64, 5, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
-                    num_harmonics, 5, padding="same", activation="sigmoid"
+                    num_harmonics, 3, padding="same", activation="sigmoid"
                 ),
             ]
         )
@@ -343,7 +322,7 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
 
 class NoiseGenerator(tf.keras.layers.Layer):
     """
-    ★改善: screech用のノイズを制御可能に
+    ★改善: ノイズ生成を控えめに
     """
 
     def __init__(self, output_length=TIME_LENGTH):
@@ -353,13 +332,13 @@ class NoiseGenerator(tf.keras.layers.Layer):
         self.envelope_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
-                    64, 5, padding="same", activation="relu"
+                    64, 7, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
                     32, 5, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
-                    1, 5, padding="same", activation="sigmoid"
+                    1, 3, padding="same", activation="sigmoid"
                 ),
             ]
         )
@@ -367,12 +346,12 @@ class NoiseGenerator(tf.keras.layers.Layer):
         self.filter_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
-                    32, 5, padding="same", activation="relu"
+                    32, 7, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
                     16, 5, padding="same", activation="relu"
                 ),
-                tf.keras.layers.Conv1D(1, 5, padding="same", activation="tanh"),
+                tf.keras.layers.Conv1D(1, 3, padding="same", activation="tanh"),
             ]
         )
 
@@ -415,16 +394,16 @@ def build_encoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM):
 
     z_mean = tf.keras.layers.Conv1D(latent_dim, 3, padding="same")(x)
 
-    # ★改善: z_logvarの初期化を調整（分散が大きすぎないように）
+    # ★改善: z_logvarの初期化を適切に
     z_logvar = tf.keras.layers.Conv1D(
         latent_dim,
         3,
         padding="same",
-        bias_initializer=tf.keras.initializers.Constant(-2.0),  # -3.0から-2.0に
+        bias_initializer=tf.keras.initializers.Constant(-1.5),
     )(x)
-    z_logvar = tf.keras.layers.Lambda(
-        lambda x: tf.clip_by_value(x, -8.0, 2.0)  # 範囲を狭める
-    )(z_logvar)
+    z_logvar = tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x, -6.0, 2.0))(
+        z_logvar
+    )
 
     return tf.keras.Model([x_in, cond_in], [z_mean, z_logvar], name="encoder")
 
@@ -473,11 +452,9 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     acid_w = tf.keras.layers.Lambda(lambda c: c[:, 2:3])(cond)
     pluck_w = tf.keras.layers.Lambda(lambda c: c[:, 3:4])(cond)
 
-    # ★改善: ノイズ比率を調整（screechのノイズを減らす）
-    noise_ratio = (
-        screech_w * 0.3 + acid_w * 0.15 + pluck_w * 0.02
-    )  # screechを0.6→0.3に
-    harmonic_ratio = 1.0 - noise_ratio * 0.2  # 倍音を優先
+    # ★重要: ノイズ比率を大幅に削減
+    noise_ratio = screech_w * 0.15 + acid_w * 0.08 + pluck_w * 0.01
+    harmonic_ratio = 1.0
 
     output = harmonic_wave * envelope * harmonic_ratio + noise * noise_ratio
     output = tf.keras.layers.Activation("tanh")(output)
@@ -495,12 +472,12 @@ class TimeWiseCVAE(tf.keras.Model):
         self.decoder = build_decoder(cond_dim, latent_dim)
 
         self.steps_per_epoch = steps_per_epoch
-        self.kl_warmup_epochs = 30  # 20→30に延長
-        self.kl_rampup_epochs = 60  # 50→60に延長
+        self.kl_warmup_epochs = 25
+        self.kl_rampup_epochs = 50
         self.kl_warmup_steps = self.kl_warmup_epochs * steps_per_epoch
         self.kl_rampup_steps = self.kl_rampup_epochs * steps_per_epoch
-        self.kl_target = 0.0003  # 0.0005→0.0003に減少
-        self.free_bits = 1.0  # 0.8→1.0に増加
+        self.kl_target = 0.0005
+        self.free_bits = 0.5
         self.z_std_ema = tf.Variable(1.0, trainable=False)
 
     def call(self, inputs):
