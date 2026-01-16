@@ -377,12 +377,11 @@ class NoiseGenerator(tf.keras.layers.Layer):
         return tf.squeeze(output, axis=-1)
 
 
-def build_encoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM):
+def build_encoder(latent_dim=LATENT_DIM):
     """
     ★CVAE設計: Encoderはaudioのみを入力（condを見ない）
     """
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1))
-    cond_in = tf.keras.Input(shape=(cond_dim,))  # 受け取るが使わない
 
     # ★重要: audioのみをエンコード（condを使わない）
     x = x_in
@@ -405,7 +404,7 @@ def build_encoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM):
     )
 
     # cond_inはモデルの入力として必要だが、計算には使わない
-    return tf.keras.Model([x_in, cond_in], [z_mean, z_logvar], name="encoder")
+    return tf.keras.Model([x_in], [z_mean, z_logvar], name="encoder")
 
 
 def sample_z(z_mean, z_logvar):
@@ -471,7 +470,7 @@ class TimeWiseCVAE(tf.keras.Model):
         self, cond_dim=COND_DIM, latent_dim=LATENT_DIM, steps_per_epoch=87
     ):
         super().__init__()
-        self.encoder = build_encoder(latent_dim, cond_dim)
+        self.encoder = build_encoder(latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
 
         self.steps_per_epoch = steps_per_epoch
@@ -487,7 +486,7 @@ class TimeWiseCVAE(tf.keras.Model):
 
     def call(self, inputs):
         x, cond = inputs
-        z_mean, z_logvar = self.encoder([x, cond])
+        z_mean, z_logvar = self.encoder(x)
         z = sample_z(z_mean, z_logvar)
         x_hat = self.decoder([z, cond])
         return x_hat, z_mean, z_logvar
