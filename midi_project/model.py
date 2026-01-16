@@ -540,8 +540,7 @@ class TimeWiseCVAE(tf.keras.Model):
         z_std = tf.reduce_mean(tf.math.reduce_std(z_mean, axis=1))
         self.z_std_ema.assign(0.99 * self.z_std_ema + 0.01 * z_std)
 
-        if recon < self.best_recon:
-            self.best_recon.assign(recon)
+        self.best_recon.assign(tf.minimum(self.best_recon, recon))
 
         return {
             "loss": loss,
