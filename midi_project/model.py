@@ -9,10 +9,10 @@ WAV_LENGTH = 1.3
 TIME_LENGTH = int(WAV_LENGTH * SR)
 NUM_HARMONICS = 32
 
-# 損失関数の重み
-recon_weight = 5.0
-STFT_weight = 15.0
-mel_weight = 10.0
+# ★改善: 損失関数の重みを調整
+recon_weight = 20.0  # 5.0 → 20.0（波形再構成を最優先）
+STFT_weight = 10.0  # 15.0 → 10.0
+mel_weight = 8.0  # 10.0 → 8.0
 kl_weight = 0.0005
 
 channels = [
@@ -27,13 +27,13 @@ LATENT_STEPS = TIME_LENGTH // 64
 
 class TimbreEnvelopeShaper(tf.keras.layers.Layer):
     """
-    ★根本改善: zから学習、condは軽いバイアスのみ
+    ★改善: condの影響を強化、zとのバランスを調整
     """
 
     def __init__(self):
         super().__init__()
 
-        # ★zから直接ADSRパラメータを生成（学習する）
+        # zからパラメータ生成
         self.envelope_param_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
@@ -42,15 +42,16 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
             ]
         )
 
-        # ★condは「バイアス」として軽く効かせる
+        # ★改善: condの影響を強化（±50%まで許容）
         self.timbre_bias_net = tf.keras.Sequential(
             [
+                tf.keras.layers.Dense(32, activation="relu"),
                 tf.keras.layers.Dense(16, activation="relu"),
-                tf.keras.layers.Dense(3, activation="tanh"),  # -1~1のバイアス
+                tf.keras.layers.Dense(3, activation="tanh"),
             ]
         )
 
-        # acid用: LFO（zから学習）
+        # LFO
         self.lfo_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(32, activation="relu"),
@@ -59,38 +60,43 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         )
 
     def call(self, base_envelope, timbre_weights, z_envelope_features):
-        # ★重要: zからパラメータを生成（これが学習される）
         z_params = self.envelope_param_net(z_envelope_features)
 
-        # condからバイアスを生成（±20%程度の調整）
-        timbre_bias = self.timbre_bias_net(timbre_weights) * 0.2
+        # ★改善: condのバイアスを±50%に（0.2 → 0.5）
+        timbre_bias = self.timbre_bias_net(timbre_weights) * 0.5
 
-        # zベース + condバイアス
         attack_param = z_params[:, 0:1] + timbre_bias[:, 0:1]
         decay_param = z_params[:, 1:2] + timbre_bias[:, 1:2]
         sustain_param = z_params[:, 2:3] + timbre_bias[:, 2:3]
 
-        # パラメータを実際の値に変換
-        attack_speed = tf.clip_by_value(attack_param * 20.0 + 2.0, 1.0, 25.0)
-        decay_rate = tf.clip_by_value(decay_param * 15.0 + 1.0, 0.5, 20.0)
-        sustain_level = tf.clip_by_value(sustain_param * 0.8 + 0.1, 0.05, 0.95)
+        # ★改善: pluckの減衰を強化
+        pluck_w = timbre_weights[:, 2:3]
+        attack_speed = tf.clip_by_value(attack_param * 20.0 + 2.0, 1.0, 30.0)
+        decay_rate = tf.clip_by_value(
+            decay_param * 15.0 + 1.0 + pluck_w * 10.0, 0.5, 30.0
+        )
+        sustain_level = tf.clip_by_value(
+            sustain_param * 0.8 + 0.1 - pluck_w * 0.4, 0.01, 0.95
+        )
 
-        # LFO（zから学習）
+        # LFO（acidのうねり強化）
         acid_w = timbre_weights[:, 1:2]
         lfo_input = tf.concat([z_envelope_features, timbre_weights], axis=-1)
         lfo_params = self.lfo_net(lfo_input)
-        lfo_rate = lfo_params[:, 0:1] * 6.0 + 2.0  # 2-8 Hz
-        lfo_depth = lfo_params[:, 1:2] * 0.4  # 最大40%の変調
+        lfo_rate = lfo_params[:, 0:1] * 6.0 + 2.0
+        lfo_depth = (
+            lfo_params[:, 1:2] * 0.6 * (0.5 + acid_w * 0.5)
+        )  # acidで深く
 
-        # ADSR生成
         time_length = tf.shape(base_envelope)[1]
         t = tf.cast(tf.range(time_length), tf.float32) / tf.cast(
             time_length, tf.float32
         )
         t = t[None, :]
 
-        attack_ratio = 0.1
-        decay_ratio = 0.25
+        # ★改善: pluck用に短いattack/decay
+        attack_ratio = 0.08 * (1.0 - pluck_w * 0.6)  # pluckで短く
+        decay_ratio = 0.20 * (1.0 + pluck_w * 0.5)  # pluckで長く
 
         attack_mask = tf.cast(t < attack_ratio, tf.float32)
         attack_curve = (t / (attack_ratio + 1e-6)) ** (1.0 / attack_speed)
@@ -104,7 +110,7 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
 
         release_mask = tf.cast(t >= decay_end, tf.float32)
         release_t = (t - decay_end) / (1.0 - decay_end + 1e-6)
-        release_curve = sustain_level * tf.exp(-decay_rate * 0.8 * release_t)
+        release_curve = sustain_level * tf.exp(-decay_rate * release_t)
 
         envelope_shape = (
             attack_mask * attack_curve
@@ -118,8 +124,8 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
             2.0 * np.pi * lfo_rate * t_seconds
         )
 
-        # ★重要: base_envelopeとenvelope_shapeの両方を活かす
-        final_envelope = base_envelope * 0.5 + envelope_shape * 0.5
+        # ★改善: zとcondのバランス調整（40:60 → condを優先）
+        final_envelope = base_envelope * 0.4 + envelope_shape * 0.6
         final_envelope = final_envelope * lfo_modulation
 
         return final_envelope
@@ -127,14 +133,13 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
 
 class TimbreShaper(tf.keras.layers.Layer):
     """
-    ★根本改善: zから倍音プロファイルを学習
+    ★改善: condの影響を強化
     """
 
     def __init__(self, num_harmonics=NUM_HARMONICS):
         super().__init__()
         self.num_harmonics = num_harmonics
 
-        # ★zから倍音プロファイルを直接生成（学習する）
         self.harmonic_profile_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
@@ -143,9 +148,10 @@ class TimbreShaper(tf.keras.layers.Layer):
             name="harmonic_profile",
         )
 
-        # condから軽いバイアス
+        # ★改善: condの影響を強化
         self.timbre_bias_net = tf.keras.Sequential(
             [
+                tf.keras.layers.Dense(32, activation="relu"),
                 tf.keras.layers.Dense(16, activation="relu"),
                 tf.keras.layers.Dense(num_harmonics, activation="tanh"),
             ],
@@ -153,23 +159,18 @@ class TimbreShaper(tf.keras.layers.Layer):
         )
 
     def call(self, base_amps, timbre_weights):
-        # ★重要: base_ampsから特徴を抽出（zの情報）
-        # base_ampsは(B, T, H)なので、時間平均を取る
-        base_amps_mean = tf.reduce_mean(base_amps, axis=1)  # (B, H)
+        base_amps_mean = tf.reduce_mean(base_amps, axis=1)
+        z_profile = self.harmonic_profile_net(base_amps_mean)
 
-        # zベースの倍音プロファイル
-        z_profile = self.harmonic_profile_net(base_amps_mean)  # (B, H)
+        # ★改善: condのバイアスを±50%に
+        timbre_bias = self.timbre_bias_net(timbre_weights) * 0.5
 
-        # condからのバイアス（±20%程度）
-        timbre_bias = self.timbre_bias_net(timbre_weights) * 0.2  # (B, H)
-
-        # 組み合わせ
         combined_profile = z_profile + timbre_bias
         combined_profile = tf.clip_by_value(combined_profile, 0.0, 1.0)
-        combined_profile = combined_profile[:, None, :]  # (B, 1, H)
+        combined_profile = combined_profile[:, None, :]
 
-        # ★重要: base_ampsを主体に、プロファイルで調整
-        shaped_amps = base_amps * (0.5 + combined_profile * 0.5)
+        # ★改善: zとcondのバランス（40:60）
+        shaped_amps = base_amps * (0.4 + combined_profile * 0.6)
         shaped_amps = tf.clip_by_value(shaped_amps, 0.0, 1.0)
 
         return shaped_amps
@@ -200,10 +201,6 @@ class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
 
 
 class EnvelopeNet(tf.keras.layers.Layer):
-    """
-    zからエンベロープを生成（condは補助的）
-    """
-
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
@@ -261,10 +258,6 @@ class EnvelopeNet(tf.keras.layers.Layer):
 
 
 class HarmonicAmplitudeNet(tf.keras.layers.Layer):
-    """
-    zから倍音振幅を生成（condは補助的）
-    """
-
     def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
         super().__init__()
         self.num_harmonics = num_harmonics
@@ -310,15 +303,10 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
 
 
 class NoiseGenerator(tf.keras.layers.Layer):
-    """
-    ★改善: zから学習、condでノイズタイプをガイド
-    """
-
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
 
-        # zからノイズエンベロープ
         self.envelope_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
@@ -333,7 +321,6 @@ class NoiseGenerator(tf.keras.layers.Layer):
             ]
         )
 
-        # zからノイズフィルタ特性
         self.filter_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
@@ -347,9 +334,10 @@ class NoiseGenerator(tf.keras.layers.Layer):
             ]
         )
 
-        # ★condからノイズ量を学習（固定値ではなく）
+        # ★改善: より強力なノイズ量ネットワーク
         self.noise_amount_net = tf.keras.Sequential(
             [
+                tf.keras.layers.Dense(32, activation="relu"),
                 tf.keras.layers.Dense(16, activation="relu"),
                 tf.keras.layers.Dense(1, activation="sigmoid"),
             ]
@@ -360,7 +348,6 @@ class NoiseGenerator(tf.keras.layers.Layer):
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        # zからノイズエンベロープ
         noise_env = self.envelope_net(z_cond)
         noise_env = tf.keras.layers.Lambda(
             lambda v: tf.squeeze(
@@ -373,15 +360,13 @@ class NoiseGenerator(tf.keras.layers.Layer):
             )
         )(noise_env)
 
-        # zからノイズフィルタ
         batch_size = tf.shape(z)[0]
         random_noise = tf.random.normal([batch_size, self.output_length, 1])
         filtered_noise = self.filter_net(random_noise)
 
-        # ★重要: condから音色ごとのノイズ量を学習
-        timbre = cond[:, 1:]  # [screech, acid, pluck]
-        noise_amount = self.noise_amount_net(timbre)  # (B, 1)
-        noise_amount = noise_amount[:, :, None]  # (B, 1, 1)
+        timbre = cond[:, 1:]
+        noise_amount = self.noise_amount_net(timbre)
+        noise_amount = noise_amount[:, :, None]
 
         output = noise_env * filtered_noise * noise_amount
 
@@ -424,34 +409,27 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # zから倍音振幅を生成
     harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
     base_harmonic_amps = harmonic_amp_net(z_in, cond)
 
-    # zから学習した倍音調整
     timbre = tf.keras.layers.Lambda(lambda c: c[:, 1:])(cond)
     timbre_shaper = TimbreShaper(num_harmonics=NUM_HARMONICS)
     shaped_harmonic_amps = timbre_shaper(base_harmonic_amps, timbre)
 
-    # zからエンベロープを生成
     envelope_net = EnvelopeNet()
     base_envelope, z_envelope_features = envelope_net(z_in, cond)
 
-    # zから学習したエンベロープ調整
     envelope_shaper = TimbreEnvelopeShaper()
     envelope = envelope_shaper(base_envelope, timbre, z_envelope_features)
 
-    # zから学習したノイズ
     noise_gen = NoiseGenerator()
     noise = noise_gen(z_in, cond)
 
-    # ピッチから基本周波数
     pitch = tf.keras.layers.Lambda(lambda c: c[:, 0])(cond)
     fundamental_freq = tf.keras.layers.Lambda(
         lambda p: 440.0 * tf.pow(2.0, ((p * 35.0 + 36.0) - 69.0) / 12.0)
     )(pitch)
 
-    # 倍音波形生成
     initial_amps = tf.keras.layers.Lambda(lambda x: x[:, 0, :])(
         shaped_harmonic_amps
     )
@@ -462,7 +440,6 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         [fundamental_freq, shaped_harmonic_amps, phases]
     )
 
-    # ★重要: 固定値ではなく、ノイズは既にNoiseGenerator内でスケール済み
     output = harmonic_wave * envelope + noise
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
@@ -486,6 +463,9 @@ class TimeWiseCVAE(tf.keras.Model):
         self.kl_target = 0.0003
         self.free_bits = 0.5
         self.z_std_ema = tf.Variable(1.0, trainable=False)
+
+        # ★改善: 再構成損失の監視
+        self.best_recon = tf.Variable(float("inf"), trainable=False)
 
     def call(self, inputs):
         x, cond = inputs
@@ -528,10 +508,12 @@ class TimeWiseCVAE(tf.keras.Model):
             )
 
             kl_weight = self.compute_kl_weight()
+
+            # ★改善: 再構成損失の重みを大幅増加
             loss = (
-                recon * recon_weight
-                + stft_loss * STFT_weight
-                + mel_loss * mel_weight
+                recon * 20.0  # 5.0 → 20.0
+                + stft_loss * 10.0  # 15.0 → 10.0
+                + mel_loss * 8.0  # 10.0 → 8.0
                 + kl_free_bits * kl_weight
             )
 
@@ -542,9 +524,14 @@ class TimeWiseCVAE(tf.keras.Model):
         z_std = tf.reduce_mean(tf.math.reduce_std(z_mean, axis=1))
         self.z_std_ema.assign(0.99 * self.z_std_ema + 0.01 * z_std)
 
+        # ★改善: best_reconの更新
+        if recon < self.best_recon:
+            self.best_recon.assign(recon)
+
         return {
             "loss": loss,
             "recon": recon,
+            "best_recon": self.best_recon,
             "stft": stft_loss,
             "mel": mel_loss,
             "kl": kl_free_bits,
