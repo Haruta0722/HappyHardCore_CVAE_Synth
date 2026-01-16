@@ -509,7 +509,7 @@ class TimeWiseCVAE(tf.keras.Model):
         x, cond = data
 
         with tf.GradientTape() as tape:
-            z_mean, z_logvar = self.encoder([x, cond])
+            z_mean, z_logvar = self.encoder(x)
             z = sample_z(z_mean, z_logvar)
             x_hat = self.decoder([z, cond])
             x_hat = x_hat[:, :TIME_LENGTH, :]
