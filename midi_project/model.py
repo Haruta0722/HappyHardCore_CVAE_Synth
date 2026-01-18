@@ -458,8 +458,8 @@ class TimeWiseCVAE(tf.keras.Model):
         self.kl_rampup_epochs = 80
         self.kl_warmup_steps = self.kl_warmup_epochs * steps_per_epoch
         self.kl_rampup_steps = self.kl_rampup_epochs * steps_per_epoch
-        self.kl_target = 0.0003  # 0.00015 → 0.0003（prior使用で増やす）
-        self.free_bits = 0.4
+        self.kl_target = 0.00005
+        self.free_bits = 0.5
         self.z_std_ema = tf.Variable(1.0, trainable=False)
         self.best_recon = tf.Variable(float("inf"), trainable=False)
 
@@ -569,4 +569,6 @@ class TimeWiseCVAE(tf.keras.Model):
             "kl_weight": kl_weight,
             "z_std_ema": self.z_std_ema,
             "grad_norm": grad_norm,
+            "prior_logvar_mean": tf.reduce_mean(prior_logvar),
+            "posterior_logvar_mean": tf.reduce_mean(z_logvar),
         }
