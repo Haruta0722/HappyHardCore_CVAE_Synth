@@ -27,8 +27,8 @@ LATENT_STEPS = TIME_LENGTH // 64
 
 class PriorNetwork(tf.keras.layers.Layer):
     """
-    ★新規: condからzの事前分布を生成
-    z=0ではなく、z=prior(cond)を使う
+    condからzの事前分布を生成
+    ★修正: logvarのclip範囲を拡大
     """
 
     def __init__(self, latent_dim=LATENT_DIM, latent_steps=LATENT_STEPS):
@@ -47,11 +47,15 @@ class PriorNetwork(tf.keras.layers.Layer):
             name="prior_mean",
         )
 
-        # condからzの分散を生成（小さめ）
+        # condからzの分散を生成
         self.prior_logvar_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(latent_steps * latent_dim),
+                tf.keras.layers.Dense(
+                    latent_steps * latent_dim,
+                    # ★修正: 初期値を-1.0に（-2.5より大きく）
+                    bias_initializer=tf.keras.initializers.Constant(-1.0),
+                ),
                 tf.keras.layers.Reshape((latent_steps, latent_dim)),
             ],
             name="prior_logvar",
@@ -60,8 +64,12 @@ class PriorNetwork(tf.keras.layers.Layer):
     def call(self, cond):
         prior_mean = self.prior_mean_net(cond)
         prior_logvar = self.prior_logvar_net(cond)
-        # 分散を小さく保つ
-        prior_logvar = tf.clip_by_value(prior_logvar, -6.0, -2.0)
+
+        # ★重要な修正: clip範囲を大幅に拡大
+        # -6.0 ~ -2.0 → -5.0 ~ 1.0
+        # Encoderの範囲（-8.0 ~ 2.0）とオーバーラップさせる
+        prior_logvar = tf.clip_by_value(prior_logvar, -5.0, 1.0)
+
         return prior_mean, prior_logvar
 
 
@@ -450,16 +458,25 @@ class TimeWiseCVAE(tf.keras.Model):
         super().__init__()
         self.encoder = build_encoder(latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
-        # ★新規: Prior Network
         self.prior_net = PriorNetwork(latent_dim, LATENT_STEPS)
 
         self.steps_per_epoch = steps_per_epoch
-        self.kl_warmup_epochs = 40
-        self.kl_rampup_epochs = 80
+
+        # ========================================
+        # ★修正1: KLアニーリングのパラメータ調整
+        # ========================================
+        self.kl_warmup_epochs = 30  # 40 → 30（少し早める）
+        self.kl_rampup_epochs = 100  # 80 → 100（よりゆっくり）
         self.kl_warmup_steps = self.kl_warmup_epochs * steps_per_epoch
         self.kl_rampup_steps = self.kl_rampup_epochs * steps_per_epoch
-        self.kl_target = 0.00005
-        self.free_bits = 0.5
+
+        # ★修正2: KL targetを適度な値に
+        # 0.00005は小さすぎる → 0.0005に増やす
+        self.kl_target = 0.0005
+
+        # ★修正3: free bitsを次元ごとに適用するため、値を調整
+        self.free_bits = 0.5  # 次元ごとの最小KL値
+
         self.z_std_ema = tf.Variable(1.0, trainable=False)
         self.best_recon = tf.Variable(float("inf"), trainable=False)
 
@@ -471,10 +488,7 @@ class TimeWiseCVAE(tf.keras.Model):
         return x_hat, z_mean, z_logvar
 
     def generate(self, cond):
-        """
-        ★新規: 推論用メソッド
-        z=0ではなく、prior(cond)からサンプリング
-        """
+        """推論用メソッド"""
         prior_mean, prior_logvar = self.prior_net(cond)
         z = sample_z(prior_mean, prior_logvar)
         x_hat = self.decoder([z, cond])
@@ -487,40 +501,40 @@ class TimeWiseCVAE(tf.keras.Model):
         rampup_progress = tf.clip_by_value(rampup_progress, 0.0, 1.0)
         return self.kl_target * rampup_progress * warmup_done
 
-    def compute_free_bits_kl(self, z_mean, z_logvar):
-        kl_per_dim = -0.5 * (
-            1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
-        )
-        kl_clamped = tf.maximum(kl_per_dim, self.free_bits)
-        return tf.reduce_mean(kl_clamped)
-
     def compute_kl_divergence(
         self, posterior_mean, posterior_logvar, prior_mean, prior_logvar
     ):
         """
-        ★新規: KL( q(z|x,c) || p(z|c) ) を計算
+        KL( q(z|x,c) || p(z|c) ) を計算
+        ★修正: 次元ごとにfree bitsを適用
         """
-        kl = 0.5 * (
+        # 次元ごとのKL divergence
+        kl_per_dim = 0.5 * (
             prior_logvar
             - posterior_logvar
             + (
                 tf.exp(posterior_logvar)
                 + tf.square(posterior_mean - prior_mean)
             )
-            / tf.exp(prior_logvar)
+            / (tf.exp(prior_logvar) + 1e-8)  # ★ゼロ除算対策
             - 1.0
         )
-        return tf.reduce_mean(kl)
+
+        # ★重要: 次元ごとにfree bitsを適用
+        kl_clamped = tf.maximum(kl_per_dim, self.free_bits)
+
+        # 全次元の平均
+        return tf.reduce_mean(kl_clamped)
 
     def train_step(self, data):
         x, cond = data
 
         with tf.GradientTape() as tape:
-            # Posterior: q(z|x)
+            # Posterior: q(z|x,c)
             z_mean, z_logvar = self.encoder(x)
             z = sample_z(z_mean, z_logvar)
 
-            # ★新規: Prior: p(z|c)
+            # Prior: p(z|c)
             prior_mean, prior_logvar = self.prior_net(cond)
 
             x_hat = self.decoder([z, cond])
@@ -535,11 +549,10 @@ class TimeWiseCVAE(tf.keras.Model):
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
-            # ★改善: KL( q(z|x,c) || p(z|c) )
+            # KL divergence（次元ごとにfree bits適用済み）
             kl_divergence = self.compute_kl_divergence(
                 z_mean, z_logvar, prior_mean, prior_logvar
             )
-            kl_divergence = tf.maximum(kl_divergence, self.free_bits)
 
             kl_weight = self.compute_kl_weight()
 
@@ -569,6 +582,9 @@ class TimeWiseCVAE(tf.keras.Model):
             "kl_weight": kl_weight,
             "z_std_ema": self.z_std_ema,
             "grad_norm": grad_norm,
+            # ★追加: デバッグ用メトリクス
             "prior_logvar_mean": tf.reduce_mean(prior_logvar),
+            "prior_logvar_std": tf.math.reduce_std(prior_logvar),
             "posterior_logvar_mean": tf.reduce_mean(z_logvar),
+            "posterior_logvar_std": tf.math.reduce_std(z_logvar),
         }
