@@ -20,20 +20,14 @@ LATENT_STEPS = TIME_LENGTH // 64
 
 
 # ========================================
-# LearnablePrototypes: 音色ごとの典型的なzを学習
+# LearnablePrototypes
 # ========================================
 class LearnablePrototypes(tf.keras.layers.Layer):
-    """
-    各音色の「プロトタイプz」を学習可能パラメータとして持つ
-    推論時はこれを使う
-    """
-
     def __init__(self, latent_dim=LATENT_DIM, latent_steps=LATENT_STEPS):
         super().__init__()
         self.latent_dim = latent_dim
         self.latent_steps = latent_steps
 
-        # 各音色の典型的なzを学習可能な重みとして定義
         self.prototypes = self.add_weight(
             name="timbre_prototypes",
             shape=(3, latent_steps, latent_dim),
@@ -43,7 +37,6 @@ class LearnablePrototypes(tf.keras.layers.Layer):
             trainable=True,
         )
 
-        # ピッチによる微調整用のネットワーク
         self.pitch_modulation = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(128, activation="relu"),
@@ -54,46 +47,27 @@ class LearnablePrototypes(tf.keras.layers.Layer):
         )
 
     def call(self, cond):
-        """
-        条件から潜在変数を取得
-
-        Args:
-            cond: [batch, 4] = [pitch, screech, acid, pluck]
-        Returns:
-            z: [batch, latent_steps, latent_dim]
-        """
         batch_size = tf.shape(cond)[0]
         pitch = cond[:, 0:1]
         timbre = cond[:, 1:]
 
-        # 音色のワンホットから対応するプロトタイプを選択
         timbre_expanded = tf.expand_dims(timbre, axis=1)
-
-        # 加重平均でプロトタイプを選択
         base_z = tf.einsum("bnt,tsd->bsd", timbre_expanded, self.prototypes)
 
-        # ピッチによる微調整
         pitch_mod = self.pitch_modulation(pitch)
-
-        # 組み合わせ（ピッチの影響は小さく）
         z = base_z + pitch_mod * 0.2
 
         return z
 
 
 # ========================================
-# HighFrequencyEmphasis: screech用の高周波強調
+# HighFrequencyEmphasis
 # ========================================
 class HighFrequencyEmphasis(tf.keras.layers.Layer):
-    """
-    screech用: 高次倍音を強調
-    """
-
     def __init__(self, num_harmonics=NUM_HARMONICS):
         super().__init__()
         self.num_harmonics = num_harmonics
 
-        # 音色ごとの高周波強調度を学習
         self.hf_emphasis_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
@@ -104,27 +78,13 @@ class HighFrequencyEmphasis(tf.keras.layers.Layer):
         )
 
     def call(self, amplitudes, timbre):
-        """
-        Args:
-            amplitudes: 倍音振幅 [batch, time_length, num_harmonics]
-            timbre: 音色ベクトル [batch, 3]
-
-        Returns:
-            emphasized_amps: 高周波強調された振幅
-        """
-        # 音色から高周波強調パターンを取得
         hf_profile = self.hf_emphasis_net(timbre)
 
-        # 高次倍音ほど強調（べき乗カーブ）
         harmonic_indices = tf.range(1, self.num_harmonics + 1, dtype=tf.float32)
-        # screechは高次倍音が強い: h^0.3 のような緩やかな減衰
         hf_curve = tf.pow(harmonic_indices / float(self.num_harmonics), 0.3)
         hf_curve = tf.reshape(hf_curve, [1, 1, self.num_harmonics])
 
-        # 音色ごとのプロファイルと組み合わせ
         hf_profile_expanded = hf_profile[:, None, :]
-
-        # 強調を適用
         emphasis_factor = 1.0 + hf_profile_expanded * hf_curve * 2.0
         emphasized_amps = amplitudes * emphasis_factor
 
@@ -132,7 +92,7 @@ class HighFrequencyEmphasis(tf.keras.layers.Layer):
 
 
 # ========================================
-# 既存のレイヤー群
+# TimbreEnvelopeShaper
 # ========================================
 class TimbreEnvelopeShaper(tf.keras.layers.Layer):
     def __init__(self):
@@ -211,6 +171,9 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         return final_envelope
 
 
+# ========================================
+# TimbreShaper
+# ========================================
 class TimbreShaper(tf.keras.layers.Layer):
     def __init__(self, num_harmonics=NUM_HARMONICS):
         super().__init__()
@@ -239,6 +202,9 @@ class TimbreShaper(tf.keras.layers.Layer):
         return shaped_amps
 
 
+# ========================================
+# GenerateHarmonicWaveTimeVarying
+# ========================================
 class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
     def __init__(self, sr=SR):
         super().__init__()
@@ -263,6 +229,9 @@ class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
         return wave
 
 
+# ========================================
+# EnvelopeNet
+# ========================================
 class EnvelopeNet(tf.keras.layers.Layer):
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
@@ -320,9 +289,10 @@ class EnvelopeNet(tf.keras.layers.Layer):
         return tf.squeeze(x, axis=-1), self.global_features
 
 
+# ========================================
+# HarmonicAmplitudeNet
+# ========================================
 class HarmonicAmplitudeNet(tf.keras.layers.Layer):
-    """★修正: HighFrequencyEmphasisを統合"""
-
     def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
         super().__init__()
         self.num_harmonics = num_harmonics
@@ -348,7 +318,6 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
             ]
         )
 
-        # ★追加: 高周波強調
         self.hf_emphasis = HighFrequencyEmphasis(num_harmonics)
 
     def call(self, z, cond):
@@ -370,16 +339,16 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
             )
         )(amps)
 
-        # ★高周波強調を適用
         timbre = cond[:, 1:]
         amps = self.hf_emphasis(amps, timbre)
 
         return amps
 
 
+# ========================================
+# NoiseGenerator
+# ========================================
 class NoiseGenerator(tf.keras.layers.Layer):
-    """★修正: ノイズ量を削減"""
-
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
@@ -443,8 +412,6 @@ class NoiseGenerator(tf.keras.layers.Layer):
 
         timbre = cond[:, 1:]
         noise_amount = self.noise_amount_net(timbre)
-
-        # ★修正: 係数を大幅削減 (0.15 → 0.02)
         noise_amount = noise_amount * 0.02
         noise_amount = noise_amount[:, :, None]
 
@@ -454,7 +421,7 @@ class NoiseGenerator(tf.keras.layers.Layer):
 
 
 # ========================================
-# Encoder / Decoder
+# Encoder
 # ========================================
 def build_encoder(latent_dim=LATENT_DIM):
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1))
@@ -485,43 +452,53 @@ def sample_z(z_mean, z_logvar):
     return z_mean + tf.exp(0.5 * z_logvar) * eps
 
 
+# ========================================
+# Decoder（★完全実装版）
+# ========================================
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # ★修正: HighFrequencyEmphasis統合済み
+    # 倍音振幅生成
     harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
     base_harmonic_amps = harmonic_amp_net(z_in, cond)
 
+    # 音色による倍音シェイピング
     timbre = tf.keras.layers.Lambda(lambda c: c[:, 1:])(cond)
     timbre_shaper = TimbreShaper(num_harmonics=NUM_HARMONICS)
     shaped_harmonic_amps = timbre_shaper(base_harmonic_amps, timbre)
 
+    # エンベロープ生成
     envelope_net = EnvelopeNet()
     base_envelope, z_envelope_features = envelope_net(z_in, cond)
 
+    # 音色によるエンベロープシェイピング
     envelope_shaper = TimbreEnvelopeShaper()
     envelope = envelope_shaper(base_envelope, timbre, z_envelope_features)
 
-    # ★修正: ノイズ量削減済み
+    # ノイズ生成
     noise_gen = NoiseGenerator()
     noise = noise_gen(z_in, cond)
 
+    # ピッチから基本周波数を計算
     pitch = tf.keras.layers.Lambda(lambda c: c[:, 0])(cond)
     fundamental_freq = tf.keras.layers.Lambda(
         lambda p: 440.0 * tf.pow(2.0, ((p * 35.0 + 36.0) - 69.0) / 12.0)
     )(pitch)
 
+    # 位相初期化
     initial_amps = tf.keras.layers.Lambda(lambda x: x[:, 0, :])(
         shaped_harmonic_amps
     )
     phases = tf.keras.layers.Lambda(lambda x: tf.zeros_like(x))(initial_amps)
 
+    # 倍音波形生成
     harmonic_wave_layer = GenerateHarmonicWaveTimeVarying()
     harmonic_wave = harmonic_wave_layer(
         [fundamental_freq, shaped_harmonic_amps, phases]
     )
 
+    # 最終合成
     output = harmonic_wave * envelope + noise
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
@@ -530,7 +507,7 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
 
 
 # ========================================
-# TimeWiseCVAE with LearnablePrototypes
+# TimeWiseCVAE
 # ========================================
 class TimeWiseCVAE(tf.keras.Model):
     def __init__(
@@ -539,8 +516,6 @@ class TimeWiseCVAE(tf.keras.Model):
         super().__init__()
         self.encoder = build_encoder(latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
-
-        # ★重要: Prior Networkの代わりにLearnablePrototypes
         self.prototypes = LearnablePrototypes(latent_dim, LATENT_STEPS)
 
         self.steps_per_epoch = steps_per_epoch
@@ -548,25 +523,23 @@ class TimeWiseCVAE(tf.keras.Model):
         self.kl_rampup_epochs = 100
         self.kl_warmup_steps = self.kl_warmup_epochs * steps_per_epoch
         self.kl_rampup_steps = self.kl_rampup_epochs * steps_per_epoch
-
-        # ★プロトタイプベースなので、KLは小さくてOK
         self.kl_target = 0.0001
         self.free_bits = 0.1
 
         self.z_std_ema = tf.Variable(1.0, trainable=False)
         self.best_recon = tf.Variable(float("inf"), trainable=False)
 
-    def call(self, inputs):
+    def call(self, inputs, training=None):
         x, cond = inputs
-        z_mean, z_logvar = self.encoder(x)
+        z_mean, z_logvar = self.encoder(x, training=training)
         z = sample_z(z_mean, z_logvar)
-        x_hat = self.decoder([z, cond])
+        x_hat = self.decoder([z, cond], training=training)
         return x_hat, z_mean, z_logvar
 
     def generate(self, cond):
-        """★推論用: プロトタイプから生成"""
+        """推論用"""
         z = self.prototypes(cond)
-        x_hat = self.decoder([z, cond])
+        x_hat = self.decoder([z, cond], training=False)
         return x_hat
 
     def compute_kl_weight(self):
@@ -580,13 +553,11 @@ class TimeWiseCVAE(tf.keras.Model):
         x, cond = data
 
         with tf.GradientTape() as tape:
-            z_mean, z_logvar = self.encoder(x)
+            z_mean, z_logvar = self.encoder(x, training=True)
             z = sample_z(z_mean, z_logvar)
-
-            # ★プロトタイプを取得
             z_prototype = self.prototypes(cond)
 
-            x_hat = self.decoder([z, cond])
+            x_hat = self.decoder([z, cond], training=True)
             x_hat = x_hat[:, :TIME_LENGTH, :]
 
             x_target = tf.squeeze(x, axis=-1)
@@ -598,7 +569,6 @@ class TimeWiseCVAE(tf.keras.Model):
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
-            # KL divergence (vs 標準正規分布)
             kl_per_dim = -0.5 * (
                 1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
             )
@@ -608,7 +578,6 @@ class TimeWiseCVAE(tf.keras.Model):
 
             kl_weight = self.compute_kl_weight()
 
-            # ★プロトタイプ損失: 訓練時のzとプロトタイプを近づける
             prototype_loss = tf.reduce_mean(
                 tf.square(z_mean - tf.stop_gradient(z_prototype))
             )
