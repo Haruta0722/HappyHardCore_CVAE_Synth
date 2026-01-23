@@ -22,12 +22,16 @@ LATENT_STEPS = TIME_LENGTH // 64
 # ========================================
 # LearnablePrototypes
 # ========================================
+# ========================================
+# LearnablePrototypes
+# ========================================
 class LearnablePrototypes(tf.keras.layers.Layer):
     def __init__(self, latent_dim=LATENT_DIM, latent_steps=LATENT_STEPS):
         super().__init__()
         self.latent_dim = latent_dim
         self.latent_steps = latent_steps
 
+        # __init__内で直接add_weightを呼ぶことで、ビルド不要にする
         self.prototypes = self.add_weight(
             name="timbre_prototypes",
             shape=(3, latent_steps, latent_dim),
@@ -506,9 +510,6 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     return tf.keras.Model([z_in, cond], output, name="decoder")
 
 
-# ========================================
-# TimeWiseCVAE
-# ========================================
 class TimeWiseCVAE(tf.keras.Model):
     def __init__(
         self, cond_dim=COND_DIM, latent_dim=LATENT_DIM, steps_per_epoch=87
@@ -553,22 +554,33 @@ class TimeWiseCVAE(tf.keras.Model):
         x, cond = data
 
         with tf.GradientTape() as tape:
+            # Encoder
             z_mean, z_logvar = self.encoder(x, training=True)
-            z = sample_z(z_mean, z_logvar)
+            z_encoder = sample_z(z_mean, z_logvar)
+
+            # ★修正: Prototypesも使う
             z_prototype = self.prototypes(cond)
 
+            # ★重要: 訓練時は両方を使う（混合）
+            # これでPrototypesにも勾配が流れる
+            mix_ratio = 0.5  # Encoderとprototypesを50%ずつ
+            z = z_encoder * mix_ratio + z_prototype * (1.0 - mix_ratio)
+
+            # Decoder
             x_hat = self.decoder([z, cond], training=True)
             x_hat = x_hat[:, :TIME_LENGTH, :]
 
             x_target = tf.squeeze(x, axis=-1)
             x_hat_sq = tf.squeeze(x_hat, axis=-1)
 
+            # 損失計算
             recon = tf.reduce_mean(tf.square(x_target - x_hat_sq))
 
             stft_loss, mel_loss, diff_loss = Loss(
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
+            # KL divergence
             kl_per_dim = -0.5 * (
                 1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
             )
@@ -578,9 +590,9 @@ class TimeWiseCVAE(tf.keras.Model):
 
             kl_weight = self.compute_kl_weight()
 
-            prototype_loss = tf.reduce_mean(
-                tf.square(z_mean - tf.stop_gradient(z_prototype))
-            )
+            # ★修正: stop_gradientを外す
+            # EncoderとPrototypesを近づける（両方に勾配が流れる）
+            prototype_loss = tf.reduce_mean(tf.square(z_mean - z_prototype))
 
             loss = (
                 recon * 25.0
@@ -590,7 +602,14 @@ class TimeWiseCVAE(tf.keras.Model):
                 + prototype_loss * 1.0
             )
 
+        # ★確認: 勾配が全変数に流れる
         grads = tape.gradient(loss, self.trainable_variables)
+
+        # デバッグ: Noneチェック
+        none_grads = [i for i, g in enumerate(grads) if g is None]
+        if none_grads:
+            print(f"警告: {len(none_grads)}個の変数に勾配がありません")
+
         grads, grad_norm = tf.clip_by_global_norm(grads, 5.0)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
