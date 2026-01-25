@@ -518,7 +518,8 @@ class TimeWiseCVAE(tf.keras.Model):
         self.encoder = build_encoder(latent_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
         self.prototypes = LearnablePrototypes(latent_dim, LATENT_STEPS)
-
+        self.cond_dim = cond_dim
+        self.latent_dim = latent_dim
         self.steps_per_epoch = steps_per_epoch
         self.kl_warmup_epochs = 30
         self.kl_rampup_epochs = 100
