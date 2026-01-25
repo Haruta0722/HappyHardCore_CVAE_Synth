@@ -550,6 +550,29 @@ class TimeWiseCVAE(tf.keras.Model):
         rampup_progress = tf.clip_by_value(rampup_progress, 0.0, 1.0)
         return self.kl_target * rampup_progress * warmup_done
 
+    def build(self, input_shape):
+        """★重要: build()メソッドを実装"""
+        # input_shape = [(batch, TIME_LENGTH, 1), (batch, 4)]
+
+        # Encoderをビルド
+        x_shape = (
+            input_shape[0]
+            if isinstance(input_shape, (list, tuple))
+            else input_shape
+        )
+        self.encoder.build(x_shape)
+
+        # Decoderをビルド
+        self.decoder.build(
+            [(None, LATENT_STEPS, self.latent_dim), (None, self.cond_dim)]
+        )
+
+        # Prototypesをビルド（実際に呼び出す）
+        dummy_cond = tf.zeros((1, self.cond_dim))
+        _ = self.prototypes(dummy_cond)
+
+        super().build(input_shape)
+
     def train_step(self, data):
         x, cond = data
 
