@@ -149,7 +149,6 @@ def train_model(resume_checkpoint=True, initial_epoch_override=None):
     print(f"  総パラメータ数: {total_params:,}")
     print(f"  - Encoder: {encoder_params:,}")
     print(f"  - Decoder: {decoder_params:,}")
-    print(f"  Prototypes shape: {model.prototypes.prototypes.shape}")
 
     # オプティマイザ設定
     optimizer = tf.keras.optimizers.Adam(learning_rate=1e-4, clipnorm=1.0)
