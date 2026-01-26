@@ -20,326 +20,35 @@ LATENT_STEPS = TIME_LENGTH // 64
 
 
 # ========================================
-# ThicknessGenerator: 音の厚みを生成
+# DDSP Module 1: Learnable Unison/Detune
 # ========================================
-class ThicknessGenerator(tf.keras.layers.Layer):
+class DDSPUnisonDetuneLayer(tf.keras.layers.Layer):
     """
-    音の厚みを実現:
-    1. 複数ボイス（Unison/Chorus効果）
-    2. 微細な周波数変動（Detune）
-    3. 位相変調（Warmth）
+    データから学習するUnison/Detune:
+    - voice数、detune量、spread量を全て学習
+    - カテゴリ分岐なし
     """
 
-    def __init__(self, num_voices=3, sr=SR):
+    def __init__(self, max_voices=16, sr=SR):
         super().__init__()
-        self.num_voices = num_voices
+        self.max_voices = max_voices
         self.sr = sr
 
-        # 音色ごとの厚みパラメータ
-        self.thickness_param_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(
-                    3, activation="sigmoid"
-                ),  # [detune, spread, phase_mod]
-            ],
-            name="thickness_params",
-        )
-
-        # zからの時間変化する厚みエンベロープ
-        self.voice_envelope_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Conv1D(
-                    64, 7, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    32, 5, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    num_voices, 3, padding="same", activation="sigmoid"
-                ),
-            ],
-            name="voice_envelopes",
-        )
-
-    def call(self, base_harmonics, z, cond, fundamental_freq):
-        """
-        Args:
-            base_harmonics: 基本倍音波形 [batch, time_length]
-            z: 潜在変数 [batch, latent_steps, latent_dim]
-            cond: 条件 [batch, 4]
-            fundamental_freq: 基本周波数 [batch]
-
-        Returns:
-            thick_harmonics: 厚みのある倍音波形 [batch, time_length]
-        """
-        batch_size = tf.shape(base_harmonics)[0]
-        time_length = tf.shape(base_harmonics)[0]
-
-        # 音色から厚みパラメータを取得
-        timbre = cond[:, 1:]
-        thickness_params = self.thickness_param_net(timbre)
-
-        detune_amount = thickness_params[:, 0:1] * 0.02  # 最大2%
-        spread_amount = thickness_params[:, 1:2] * 0.5
-        phase_mod_depth = thickness_params[:, 2:3] * 0.3
-
-        # zから時間変化する各ボイスのエンベロープ
-        latent_steps = tf.shape(z)[1]
-        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
-        z_cond = tf.concat([z, cond_broadcast], axis=-1)
-
-        voice_envelopes = self.voice_envelope_net(
-            z_cond
-        )  # [batch, latent_steps, num_voices]
-
-        # 時間軸にアップサンプル
-        voice_envelopes = tf.image.resize(
-            tf.expand_dims(voice_envelopes, axis=2),
-            [TIME_LENGTH, 1],
-            method="bilinear",
-        )
-        voice_envelopes = tf.squeeze(
-            voice_envelopes, axis=2
-        )  # [batch, time_length, num_voices]
-
-        # 複数ボイスを生成
-        thick_output = tf.zeros_like(base_harmonics)
-
-        for voice_idx in range(self.num_voices):
-            # 各ボイスのデチューン量
-            detune_offset = (
-                voice_idx - (self.num_voices - 1) / 2
-            ) / self.num_voices
-            detune_factor = detune_offset * detune_amount[:, 0]
-
-            # 位相シフトで擬似的にデチューン効果
-            # 実際の周波数変調の代わりに時間シフトで近似
-            shift_samples = tf.cast(detune_factor * 10.0, tf.int32)
-
-            # 各バッチアイテムごとにシフト
-            shifted_harmonics = tf.roll(
-                base_harmonics, shift=voice_idx - 1, axis=1
-            )
-
-            # 位相変調（LFOによる揺らぎ）
-            t = tf.cast(tf.range(TIME_LENGTH), tf.float32) / self.sr
-            lfo_rate = 5.0 + voice_idx * 2.0
-            phase_lfo = phase_mod_depth[:, 0:1] * tf.sin(
-                2 * np.pi * lfo_rate * t
-            )
-            phase_lfo = phase_lfo[:, :TIME_LENGTH]
-
-            # 簡易的な位相変調（振幅変調で近似）
-            modulated = shifted_harmonics * (1.0 + phase_lfo * 0.1)
-
-            # ボイスエンベロープを適用
-            voice_env = voice_envelopes[:, :, voice_idx]
-
-            # パンニング（ステレオ的広がり）
-            pan = (voice_idx - (self.num_voices - 1) / 2) / self.num_voices
-            pan_weight = 1.0 - tf.abs(pan) * spread_amount[:, 0:1]
-
-            thick_output += modulated * voice_env * pan_weight
-
-        # 正規化
-        thick_output = thick_output / float(self.num_voices)
-
-        return thick_output
-
-
-# ========================================
-# 改良版HighFrequencyEmphasis
-# ========================================
-class HighFrequencyEmphasis(tf.keras.layers.Layer):
-    """
-    screech用: zからの情報も使って高周波を強調
-    """
-
-    def __init__(self, num_harmonics=NUM_HARMONICS):
-        super().__init__()
-        self.num_harmonics = num_harmonics
-
-        # zと音色の両方から高周波プロファイルを生成
-        self.hf_profile_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(128, activation="relu"),
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(num_harmonics, activation="sigmoid"),
-            ],
-            name="hf_profile",
-        )
-
-    def call(self, amplitudes, timbre, z_features):
-        """
-        Args:
-            amplitudes: [batch, time_length, num_harmonics]
-            timbre: [batch, 3]
-            z_features: [batch, feature_dim] - zから抽出した特徴
-        """
-        # zと音色を結合
-        combined = tf.concat([z_features, timbre], axis=-1)
-        hf_profile = self.hf_profile_net(combined)
-
-        # 高次倍音の強調カーブ
-        harmonic_indices = tf.range(1, self.num_harmonics + 1, dtype=tf.float32)
-
-        # screech用: より緩やかな減衰（h^0.2）
-        hf_curve = tf.pow(harmonic_indices / float(self.num_harmonics), 0.2)
-        hf_curve = tf.reshape(hf_curve, [1, 1, self.num_harmonics])
-
-        hf_profile_expanded = hf_profile[:, None, :]
-
-        # 強調を適用（より強い強調）
-        emphasis_factor = 1.0 + hf_profile_expanded * hf_curve * 3.0
-        emphasized_amps = amplitudes * emphasis_factor
-
-        return emphasized_amps
-
-
-# ========================================
-# 既存レイヤー（変更なし）
-# ========================================
-class TimbreEnvelopeShaper(tf.keras.layers.Layer):
-    def __init__(self):
-        super().__init__()
-
-        self.adsr_param_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(128, activation="relu"),
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(3, activation="sigmoid"),
-            ],
-            name="adsr_param_net",
-        )
-
-        self.lfo_param_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(2, activation="sigmoid"),
-            ],
-            name="lfo_param_net",
-        )
-
-    def call(self, base_envelope, timbre_weights, z_envelope_features):
-        combined_input = tf.concat(
-            [z_envelope_features, timbre_weights], axis=-1
-        )
-
-        adsr_params = self.adsr_param_net(combined_input)
-        attack_speed = adsr_params[:, 0:1] * 25.0 + 1.0
-        decay_rate = adsr_params[:, 1:2] * 20.0 + 0.5
-        sustain_level = adsr_params[:, 2:3] * 0.9 + 0.05
-
-        lfo_params = self.lfo_param_net(combined_input)
-        lfo_rate = lfo_params[:, 0:1] * 8.0 + 1.0
-        lfo_depth = lfo_params[:, 1:2] * 0.6
-
-        time_length = tf.shape(base_envelope)[1]
-        t = tf.cast(tf.range(time_length), tf.float32) / tf.cast(
-            time_length, tf.float32
-        )
-        t = t[None, :]
-
-        attack_ratio = 0.08
-        decay_ratio = 0.22
-
-        attack_mask = tf.cast(t < attack_ratio, tf.float32)
-        attack_curve = (t / (attack_ratio + 1e-6)) ** (1.0 / attack_speed)
-
-        decay_end = attack_ratio + decay_ratio
-        decay_mask = tf.cast((t >= attack_ratio) & (t < decay_end), tf.float32)
-        decay_t = (t - attack_ratio) / (decay_ratio + 1e-6)
-        decay_curve = 1.0 - (1.0 - sustain_level) * (
-            1.0 - tf.exp(-decay_rate * decay_t)
-        )
-
-        release_mask = tf.cast(t >= decay_end, tf.float32)
-        release_t = (t - decay_end) / (1.0 - decay_end + 1e-6)
-        release_curve = sustain_level * tf.exp(-decay_rate * release_t)
-
-        envelope_shape = (
-            attack_mask * attack_curve
-            + decay_mask * decay_curve
-            + release_mask * release_curve
-        )
-
-        t_seconds = t * WAV_LENGTH
-        lfo_modulation = 1.0 + lfo_depth * tf.sin(
-            2.0 * np.pi * lfo_rate * t_seconds
-        )
-
-        final_envelope = base_envelope * 0.3 + envelope_shape * 0.7
-        final_envelope = final_envelope * lfo_modulation
-
-        return final_envelope
-
-
-class TimbreShaper(tf.keras.layers.Layer):
-    def __init__(self, num_harmonics=NUM_HARMONICS):
-        super().__init__()
-        self.num_harmonics = num_harmonics
-
-        self.harmonic_profile_net = tf.keras.Sequential(
+        # z + condから全パラメータを学習
+        self.param_predictor = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(256, activation="relu"),
                 tf.keras.layers.Dense(128, activation="relu"),
                 tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(num_harmonics, activation="sigmoid"),
+                # [num_voices, detune_cents, spread, phase_mod_depth]
+                tf.keras.layers.Dense(4, activation=None),
             ],
-            name="harmonic_profile_net",
+            name="unison_params",
         )
 
-    def call(self, base_amps, timbre_weights):
-        base_amps_mean = tf.reduce_mean(base_amps, axis=1)
-        combined_input = tf.concat([base_amps_mean, timbre_weights], axis=-1)
-
-        harmonic_profile = self.harmonic_profile_net(combined_input)
-        harmonic_profile = harmonic_profile[:, None, :]
-
-        shaped_amps = base_amps * (0.5 + harmonic_profile * 0.5)
-        shaped_amps = tf.clip_by_value(shaped_amps, 0.0, 1.0)
-
-        return shaped_amps
-
-
-class GenerateHarmonicWaveTimeVarying(tf.keras.layers.Layer):
-    def __init__(self, sr=SR):
-        super().__init__()
-        self.sr = float(sr)
-
-    def call(self, inputs):
-        fundamental_freq, amplitudes_time, phases = inputs
-        batch_size = tf.shape(fundamental_freq)[0]
-        time_length = tf.shape(amplitudes_time)[1]
-        num_harmonics = tf.shape(amplitudes_time)[2]
-
-        t = tf.cast(tf.range(time_length), tf.float32) / float(self.sr)
-        t = tf.reshape(t, [1, -1, 1])
-        f0 = tf.reshape(fundamental_freq, [-1, 1, 1])
-        harmonic_nums = tf.cast(tf.range(1, num_harmonics + 1), tf.float32)
-        harmonic_nums = tf.reshape(harmonic_nums, [1, 1, -1])
-
-        omega = 2.0 * np.pi * f0 * harmonic_nums
-        phas = tf.reshape(phases, [-1, 1, num_harmonics])
-        harmonics = amplitudes_time * tf.sin(omega * t + phas)
-        wave = tf.reduce_sum(harmonics, axis=-1)
-        return wave
-
-
-class EnvelopeNet(tf.keras.layers.Layer):
-    def __init__(self, output_length=TIME_LENGTH):
-        super().__init__()
-        self.output_length = output_length
-
-        self.net = tf.keras.Sequential(
+        # 各voiceの時間変化するゲイン
+        self.voice_gain_net = tf.keras.Sequential(
             [
-                tf.keras.layers.Conv1D(
-                    128, 9, padding="same", activation="relu"
-                ),
                 tf.keras.layers.Conv1D(
                     128, 7, padding="same", activation="relu"
                 ),
@@ -347,56 +56,143 @@ class EnvelopeNet(tf.keras.layers.Layer):
                     64, 5, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
-                    32, 5, padding="same", activation="relu"
+                    max_voices, 3, padding="same", activation=None
                 ),
-                tf.keras.layers.Conv1D(
-                    1, 3, padding="same", activation="sigmoid"
-                ),
-            ]
+            ],
+            name="voice_gains",
         )
 
-        self.global_feature_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.GlobalAveragePooling1D(),
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-            ]
-        )
+    def call(self, base_signal, z, cond, fundamental_freq):
+        """
+        Args:
+            base_signal: [batch, time_length]
+            z: [batch, latent_steps, latent_dim]
+            cond: [batch, cond_dim]
+            fundamental_freq: [batch]
+        """
+        batch_size = tf.shape(base_signal)[0]
 
-    def call(self, z, cond):
-        batch_size = tf.shape(z)[0]
+        # zの全体特徴を抽出
+        z_global = tf.reduce_mean(z, axis=1)  # [batch, latent_dim]
+        combined_input = tf.concat([z_global, cond], axis=-1)
+
+        # パラメータ予測
+        params = self.param_predictor(combined_input)  # [batch, 4]
+
+        # 各パラメータを適切な範囲に変換
+        num_voices_logit = params[:, 0:1]  # [-inf, inf]
+        num_voices = 1.0 + 14.0 * tf.nn.sigmoid(num_voices_logit)  # [1, 16]
+
+        detune_cents = params[:, 1:2] * 50.0  # [-50, 50] cents
+
+        spread_amount = tf.nn.sigmoid(params[:, 2:3])  # [0, 1]
+
+        phase_mod_depth = tf.nn.sigmoid(params[:, 3:4]) * 0.5  # [0, 0.5]
+
+        # 時間変化するvoiceゲイン
         latent_steps = tf.shape(z)[1]
-
-        self.global_features = self.global_feature_net(z)
-
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        x = self.net(z_cond)
-        x = tf.keras.layers.Lambda(
-            lambda v: tf.squeeze(
-                tf.image.resize(
-                    tf.expand_dims(v, axis=2),
-                    [self.output_length, 1],
-                    method="bilinear",
-                ),
-                axis=2,
+        voice_gains_latent = self.voice_gain_net(
+            z_cond
+        )  # [batch, latent_steps, max_voices]
+
+        # 時間軸にアップサンプル
+        voice_gains = tf.image.resize(
+            tf.expand_dims(voice_gains_latent, axis=2),
+            [TIME_LENGTH, 1],
+            method="bilinear",
+        )
+        voice_gains = tf.squeeze(
+            voice_gains, axis=2
+        )  # [batch, time_length, max_voices]
+        voice_gains = tf.nn.softplus(voice_gains)  # 正の値に
+
+        # voiceごとのdetune適用
+        unison_output = tf.zeros_like(base_signal)
+
+        for voice_idx in range(self.max_voices):
+            # voiceの位置（-0.5 ~ 0.5）
+            voice_position = (
+                voice_idx - (self.max_voices - 1) / 2.0
+            ) / self.max_voices
+
+            # detune量（cents）
+            voice_detune_cents = voice_position * detune_cents[:, 0]
+
+            # centsから周波数比に変換
+            freq_ratio = tf.pow(2.0, voice_detune_cents / 1200.0)
+
+            # 時間軸での位相シフト（デチューン近似）
+            # より正確には周波数変調が必要だが、計算効率のため時間シフト
+            phase_shift = voice_detune_cents * 0.1  # 経験的スケーリング
+            shift_samples = tf.cast(phase_shift, tf.int32)
+
+            # バッチごとのシフトは複雑なため、voiceインデックスベースのシフト
+            shifted = tf.roll(
+                base_signal,
+                shift=int(voice_position * 20),  # -10 ~ 10サンプル
+                axis=1,
             )
-        )(x)
 
-        return tf.squeeze(x, axis=-1), self.global_features
+            # 位相変調（warmth）
+            t = tf.cast(tf.range(TIME_LENGTH), tf.float32) / self.sr
+            lfo_freq = 3.0 + voice_idx * 0.3
+            phase_lfo = phase_mod_depth[:, 0:1] * tf.sin(
+                2 * np.pi * lfo_freq * t
+            )
+            phase_lfo = phase_lfo[:, :TIME_LENGTH]
+
+            modulated = shifted * (1.0 + phase_lfo * 0.2)
+
+            # voiceゲインを適用
+            voice_gain = voice_gains[:, :, voice_idx]
+
+            # ステレオ的広がり（パンニング）
+            pan_weight = (
+                1.0 - tf.abs(voice_position) * spread_amount[:, 0:1] * 0.5
+            )
+
+            unison_output += modulated * voice_gain * pan_weight
+
+        # ソフトマスキング: 学習されたnum_voicesに応じて出力を調整
+        # num_voices=2なら少数voiceのみ、num_voices=16なら全voiceを使用
+        voice_mask = tf.nn.sigmoid(
+            (num_voices - tf.range(0.0, self.max_voices, dtype=tf.float32))
+            * 2.0
+        )
+        voice_mask = tf.reshape(voice_mask, [batch_size, 1, self.max_voices])
+
+        # 正規化（voice数に応じて自動調整）
+        effective_voices = tf.reduce_sum(voice_mask, axis=-1, keepdims=True)
+        normalization = tf.sqrt(effective_voices + 1e-6)
+
+        unison_output_masked = (
+            tf.reduce_sum(voice_gains * voice_mask, axis=-1)
+            / (normalization[:, :, 0] + 1e-6)
+            * unison_output
+        )
+
+        return unison_output_masked
 
 
 # ========================================
-# 改良版HarmonicAmplitudeNet
+# DDSP Module 2: Learnable Harmonic Distribution
 # ========================================
-class HarmonicAmplitudeNet(tf.keras.layers.Layer):
-    def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
+class DDSPHarmonicDistribution(tf.keras.layers.Layer):
+    """
+    倍音分布を完全に学習:
+    - 各倍音の振幅を時間変化として予測
+    - 高周波強調もデータから学習
+    """
+
+    def __init__(self, num_harmonics=NUM_HARMONICS):
         super().__init__()
         self.num_harmonics = num_harmonics
-        self.output_length = output_length
 
-        self.net = tf.keras.Sequential(
+        # 倍音振幅の時間変化を予測
+        self.harmonic_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
                     256, 9, padding="same", activation="relu"
@@ -411,53 +207,72 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
                     64, 5, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
-                    num_harmonics, 3, padding="same", activation="sigmoid"
+                    num_harmonics, 3, padding="same", activation=None
                 ),
-            ]
-        )
-
-        # zから特徴を抽出
-        self.z_feature_extractor = tf.keras.Sequential(
-            [
-                tf.keras.layers.GlobalAveragePooling1D(),
-                tf.keras.layers.Dense(64, activation="relu"),
             ],
-            name="z_features",
+            name="harmonic_amps",
         )
 
-        # 改良版高周波強調
-        self.hf_emphasis = HighFrequencyEmphasis(num_harmonics)
+        # 周波数依存の修正項（高周波強調など）
+        self.freq_shaping_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Dense(128, activation="relu"),
+                tf.keras.layers.Dense(64, activation="relu"),
+                tf.keras.layers.Dense(num_harmonics, activation=None),
+            ],
+            name="freq_shaping",
+        )
 
-    def call(self, z, cond):
+    def call(self, z, cond, output_length=TIME_LENGTH):
+        """
+        Returns:
+            amplitudes: [batch, time_length, num_harmonics]
+        """
         batch_size = tf.shape(z)[0]
         latent_steps = tf.shape(z)[1]
 
+        # 条件をブロードキャスト
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        amps = self.net(z_cond)
-        amps = tf.keras.layers.Lambda(
-            lambda v: tf.squeeze(
-                tf.image.resize(
-                    tf.expand_dims(v, axis=2),
-                    [self.output_length, 1],
-                    method="bilinear",
-                ),
-                axis=2,
-            )
-        )(amps)
+        # 時間変化する倍音振幅
+        amps_latent = self.harmonic_net(
+            z_cond
+        )  # [batch, latent_steps, num_harmonics]
 
-        # zから特徴を抽出
-        z_features = self.z_feature_extractor(z)
+        # アップサンプル
+        amps = tf.image.resize(
+            tf.expand_dims(amps_latent, axis=2),
+            [output_length, 1],
+            method="bilinear",
+        )
+        amps = tf.squeeze(amps, axis=2)  # [batch, time_length, num_harmonics]
 
-        # 高周波強調（zの情報も使う）
-        timbre = cond[:, 1:]
-        amps = self.hf_emphasis(amps, timbre, z_features)
+        # 周波数依存のシェイピング
+        z_global = tf.reduce_mean(z, axis=1)
+        combined = tf.concat([z_global, cond], axis=-1)
+        freq_shaping = self.freq_shaping_net(combined)  # [batch, num_harmonics]
+
+        # 加算的に適用（学習の安定性向上）
+        freq_shaping_expanded = freq_shaping[:, None, :]
+        amps = amps + freq_shaping_expanded * 0.5
+
+        # sigmoid で [0, 1] に正規化
+        amps = tf.nn.sigmoid(amps)
 
         return amps
 
 
-class NoiseGenerator(tf.keras.layers.Layer):
+# ========================================
+# DDSP Module 3: Learnable Envelope
+# ========================================
+class DDSPEnvelopeGenerator(tf.keras.layers.Layer):
+    """
+    エンベロープを完全に学習:
+    - ADSR等の明示的構造なし
+    - 時間変化する振幅を直接予測
+    """
+
     def __init__(self, output_length=TIME_LENGTH):
         super().__init__()
         self.output_length = output_length
@@ -465,72 +280,270 @@ class NoiseGenerator(tf.keras.layers.Layer):
         self.envelope_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
+                    128, 9, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    128, 7, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    32, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(1, 3, padding="same", activation=None),
+            ],
+            name="envelope",
+        )
+
+        # LFO的な変調を学習
+        self.modulation_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
                     64, 7, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
                     32, 5, padding="same", activation="relu"
                 ),
-                tf.keras.layers.Conv1D(
-                    1, 3, padding="same", activation="sigmoid"
-                ),
-            ]
+                tf.keras.layers.Conv1D(1, 3, padding="same", activation=None),
+            ],
+            name="modulation",
         )
 
-        self.filter_net = tf.keras.Sequential(
+    def call(self, z, cond):
+        """
+        Returns:
+            envelope: [batch, time_length]
+        """
+        latent_steps = tf.shape(z)[1]
+        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
+        z_cond = tf.concat([z, cond_broadcast], axis=-1)
+
+        # ベースエンベロープ
+        env_latent = self.envelope_net(z_cond)
+
+        # アップサンプル
+        env = tf.image.resize(
+            tf.expand_dims(env_latent, axis=2),
+            [self.output_length, 1],
+            method="bilinear",
+        )
+        env = tf.squeeze(env, axis=[2, 3])
+
+        # 変調成分
+        mod_latent = self.modulation_net(z_cond)
+        mod = tf.image.resize(
+            tf.expand_dims(mod_latent, axis=2),
+            [self.output_length, 1],
+            method="bilinear",
+        )
+        mod = tf.squeeze(mod, axis=[2, 3])
+
+        # 変調を加算的に適用
+        final_envelope = env + mod * 0.3
+
+        # sigmoid で [0, 1]
+        final_envelope = tf.nn.sigmoid(final_envelope)
+
+        return final_envelope
+
+
+# ========================================
+# DDSP Module 4: Learnable Noise
+# ========================================
+class DDSPNoiseGenerator(tf.keras.layers.Layer):
+    """
+    ノイズ成分を学習:
+    - フィルタ特性
+    - エンベロープ
+    - 混合量
+    """
+
+    def __init__(self, output_length=TIME_LENGTH):
+        super().__init__()
+        self.output_length = output_length
+
+        # ノイズエンベロープ
+        self.noise_env_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Conv1D(
-                    32, 9, padding="same", activation="relu"
+                    64, 7, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    32, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(1, 3, padding="same", activation=None),
+            ],
+            name="noise_envelope",
+        )
+
+        # ノイズフィルタ
+        self.noise_filter_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    64, 15, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    32, 11, padding="same", activation="relu"
                 ),
                 tf.keras.layers.Conv1D(
                     16, 7, padding="same", activation="relu"
                 ),
-                tf.keras.layers.Conv1D(8, 5, padding="same", activation="relu"),
-                tf.keras.layers.Conv1D(1, 3, padding="same", activation="tanh"),
-            ]
+                tf.keras.layers.Conv1D(1, 5, padding="same", activation="tanh"),
+            ],
+            name="noise_filter",
         )
 
+        # 全体のノイズ量を予測
         self.noise_amount_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
                 tf.keras.layers.Dense(1, activation="sigmoid"),
             ],
-            name="noise_amount_net",
+            name="noise_amount",
         )
 
     def call(self, z, cond):
+        """
+        Returns:
+            noise: [batch, time_length]
+        """
+        batch_size = tf.shape(z)[0]
         latent_steps = tf.shape(z)[1]
+
         cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         z_cond = tf.concat([z, cond_broadcast], axis=-1)
 
-        noise_env = self.envelope_net(z_cond)
-        noise_env = tf.keras.layers.Lambda(
-            lambda v: tf.squeeze(
-                tf.image.resize(
-                    tf.expand_dims(v, axis=2),
-                    [self.output_length, 1],
-                    method="bilinear",
-                ),
-                axis=2,
-            )
-        )(noise_env)
+        # ノイズエンベロープ
+        noise_env_latent = self.noise_env_net(z_cond)
+        noise_env = tf.image.resize(
+            tf.expand_dims(noise_env_latent, axis=2),
+            [self.output_length, 1],
+            method="bilinear",
+        )
+        noise_env = tf.squeeze(noise_env, axis=[2, 3])
+        noise_env = tf.nn.sigmoid(noise_env)
 
-        batch_size = tf.shape(z)[0]
+        # ランダムノイズ生成
         random_noise = tf.random.normal([batch_size, self.output_length, 1])
-        filtered_noise = self.filter_net(random_noise)
 
-        timbre = cond[:, 1:]
-        noise_amount = self.noise_amount_net(timbre)
+        # フィルタリング
+        filtered_noise = self.noise_filter_net(random_noise)
+        filtered_noise = tf.squeeze(filtered_noise, axis=-1)
 
-        # さらに削減（0.02 → 0.01）
-        noise_amount = noise_amount * 0.01
-        noise_amount = noise_amount[:, :, None]
+        # 全体のノイズ量
+        z_global = tf.reduce_mean(z, axis=1)
+        combined = tf.concat([z_global, cond], axis=-1)
+        noise_amount = self.noise_amount_net(combined)
+        noise_amount = noise_amount * 0.02  # スケーリング
 
-        output = noise_env * filtered_noise * noise_amount
+        # 合成
+        noise = filtered_noise * noise_env * noise_amount
 
-        return tf.squeeze(output, axis=-1)
+        return noise
 
 
+# ========================================
+# DDSP Synthesizer: 全モジュールを統合
+# ========================================
+class DDSPSynthesizer(tf.keras.layers.Layer):
+    """
+    DDSPベースのシンセサイザー:
+    倍音生成 → Unison → Envelope → Noise
+    """
+
+    def __init__(self, num_harmonics=NUM_HARMONICS, max_voices=16, sr=SR):
+        super().__init__()
+        self.num_harmonics = num_harmonics
+        self.sr = float(sr)
+
+        # DDSPモジュール
+        self.harmonic_dist = DDSPHarmonicDistribution(num_harmonics)
+        self.envelope_gen = DDSPEnvelopeGenerator()
+        self.unison_detune = DDSPUnisonDetuneLayer(max_voices, sr)
+        self.noise_gen = DDSPNoiseGenerator()
+
+    def generate_harmonic_wave(self, fundamental_freq, amplitudes_time, phases):
+        """
+        倍音から波形生成（微分可能）
+        """
+        batch_size = tf.shape(fundamental_freq)[0]
+        time_length = tf.shape(amplitudes_time)[1]
+        num_harmonics = tf.shape(amplitudes_time)[2]
+
+        t = tf.cast(tf.range(time_length), tf.float32) / self.sr
+        t = tf.reshape(t, [1, -1, 1])
+        f0 = tf.reshape(fundamental_freq, [-1, 1, 1])
+        harmonic_nums = tf.cast(tf.range(1, num_harmonics + 1), tf.float32)
+        harmonic_nums = tf.reshape(harmonic_nums, [1, 1, -1])
+
+        omega = 2.0 * np.pi * f0 * harmonic_nums
+        phas = tf.reshape(phases, [-1, 1, num_harmonics])
+
+        harmonics = amplitudes_time * tf.sin(omega * t + phas)
+        wave = tf.reduce_sum(harmonics, axis=-1)
+
+        return wave
+
+    def call(self, z, cond):
+        """
+        Args:
+            z: [batch, latent_steps, latent_dim]
+            cond: [batch, cond_dim]  # [pitch, timbre1, timbre2, timbre3]
+
+        Returns:
+            output: [batch, time_length, 1]
+        """
+        batch_size = tf.shape(z)[0]
+
+        # 1. ピッチから基本周波数
+        pitch = cond[:, 0]
+        fundamental_freq = 440.0 * tf.pow(
+            2.0, ((pitch * 35.0 + 36.0) - 69.0) / 12.0
+        )
+
+        # 2. 倍音分布を予測
+        harmonic_amps = self.harmonic_dist(
+            z, cond
+        )  # [batch, time, num_harmonics]
+
+        # 3. 位相初期化（ゼロ位相）
+        initial_amps = harmonic_amps[:, 0, :]
+        phases = tf.zeros_like(initial_amps)
+
+        # 4. 倍音から基本波形生成
+        base_harmonic_wave = self.generate_harmonic_wave(
+            fundamental_freq, harmonic_amps, phases
+        )
+
+        # 5. Unison/Detune適用
+        thick_wave = self.unison_detune(
+            base_harmonic_wave, z, cond, fundamental_freq
+        )
+
+        # 6. エンベロープ適用
+        envelope = self.envelope_gen(z, cond)
+        enveloped_wave = thick_wave * envelope
+
+        # 7. ノイズ追加
+        noise = self.noise_gen(z, cond)
+
+        # 8. 最終合成
+        output = enveloped_wave + noise
+
+        # tanh で [-1, 1] にクリップ
+        output = tf.nn.tanh(output)
+
+        # [batch, time, 1]
+        output = tf.expand_dims(output, axis=-1)
+
+        return output
+
+
+# ========================================
+# Encoder (変更なし)
+# ========================================
 def build_encoder(latent_dim=LATENT_DIM):
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1))
     x = x_in
@@ -561,67 +574,22 @@ def sample_z(z_mean, z_logvar):
 
 
 # ========================================
-# ★改良版Decoder: ThicknessGeneratorを統合
+# DDSP Decoder
 # ========================================
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # 倍音振幅生成（改良版）
-    harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
-    base_harmonic_amps = harmonic_amp_net(z_in, cond)
+    # DDSPシンセサイザー
+    synth = DDSPSynthesizer(num_harmonics=NUM_HARMONICS, max_voices=16, sr=SR)
 
-    # 音色による倍音シェイピング
-    timbre = tf.keras.layers.Lambda(lambda c: c[:, 1:])(cond)
-    timbre_shaper = TimbreShaper(num_harmonics=NUM_HARMONICS)
-    shaped_harmonic_amps = timbre_shaper(base_harmonic_amps, timbre)
+    output = synth(z_in, cond)
 
-    # エンベロープ生成
-    envelope_net = EnvelopeNet()
-    base_envelope, z_envelope_features = envelope_net(z_in, cond)
-
-    # 音色によるエンベロープシェイピング
-    envelope_shaper = TimbreEnvelopeShaper()
-    envelope = envelope_shaper(base_envelope, timbre, z_envelope_features)
-
-    # ノイズ生成
-    noise_gen = NoiseGenerator()
-    noise = noise_gen(z_in, cond)
-
-    # ピッチから基本周波数を計算
-    pitch = tf.keras.layers.Lambda(lambda c: c[:, 0])(cond)
-    fundamental_freq = tf.keras.layers.Lambda(
-        lambda p: 440.0 * tf.pow(2.0, ((p * 35.0 + 36.0) - 69.0) / 12.0)
-    )(pitch)
-
-    # 位相初期化
-    initial_amps = tf.keras.layers.Lambda(lambda x: x[:, 0, :])(
-        shaped_harmonic_amps
-    )
-    phases = tf.keras.layers.Lambda(lambda x: tf.zeros_like(x))(initial_amps)
-
-    # 基本倍音波形生成
-    harmonic_wave_layer = GenerateHarmonicWaveTimeVarying()
-    base_harmonic_wave = harmonic_wave_layer(
-        [fundamental_freq, shaped_harmonic_amps, phases]
-    )
-
-    # ★重要: ThicknessGeneratorで厚みを追加
-    thickness_gen = ThicknessGenerator(num_voices=3)
-    thick_harmonic_wave = thickness_gen(
-        base_harmonic_wave, z_in, cond, fundamental_freq
-    )
-
-    # 最終合成
-    output = thick_harmonic_wave * envelope + noise
-    output = tf.keras.layers.Activation("tanh")(output)
-    output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
-
-    return tf.keras.Model([z_in, cond], output, name="decoder")
+    return tf.keras.Model([z_in, cond], output, name="ddsp_decoder")
 
 
 # ========================================
-# TimeWiseCVAE（Prototypesなし版）
+# TimeWiseCVAE with DDSP
 # ========================================
 class TimeWiseCVAE(tf.keras.Model):
     def __init__(
@@ -650,7 +618,6 @@ class TimeWiseCVAE(tf.keras.Model):
 
     def generate(self, cond):
         """推論用: ゼロベクトルから生成"""
-        # partialモデルなので、ゼロベクトルを使用
         z = tf.zeros((tf.shape(cond)[0], LATENT_STEPS, LATENT_DIM))
         x_hat = self.decoder([z, cond], training=False)
         return x_hat
@@ -716,7 +683,3 @@ class TimeWiseCVAE(tf.keras.Model):
             "z_std_ema": self.z_std_ema,
             "grad_norm": grad_norm,
         }
-
-
-# ========================================
-# 実装のまとめ
