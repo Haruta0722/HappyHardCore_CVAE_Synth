@@ -145,14 +145,10 @@ def train_model(resume_checkpoint=True, initial_epoch_override=None):
     decoder_params = sum(
         [tf.size(v).numpy() for v in model.decoder.trainable_variables]
     )
-    prototype_params = sum(
-        [tf.size(v).numpy() for v in model.prototypes.trainable_variables]
-    )
 
     print(f"  総パラメータ数: {total_params:,}")
     print(f"  - Encoder: {encoder_params:,}")
     print(f"  - Decoder: {decoder_params:,}")
-    print(f"  - Prototypes: {prototype_params:,}")
     print(f"  Prototypes shape: {model.prototypes.prototypes.shape}")
 
     # オプティマイザ設定
