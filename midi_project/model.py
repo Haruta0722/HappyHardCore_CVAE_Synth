@@ -97,12 +97,12 @@ def compute_high_freq_emphasis_loss(y_true, y_pred, sr=SR, cutoff_freq=2000.0):
 
 
 # ========================================
-# 適応的ノイズジェネレータ（周波数帯域別）
+# 適応的ノイズジェネレータ（音色別に調整）
 # ========================================
 class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
     """
     周波数帯域別にノイズを生成
-    screech特有のざらついた高周波ノイズを学習
+    音色ごとに最適なノイズ量を自動調整（pluckは少なく）
     """
 
     def __init__(self, output_length=TIME_LENGTH, num_bands=4):
@@ -146,12 +146,14 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
                 )
             )
 
-        # 全体のノイズ量を学習（音色から）
+        # 全体のノイズ量を学習（音色から）★より柔軟に
         self.noise_intensity_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(num_bands, activation="sigmoid"),
+                tf.keras.layers.Dense(
+                    num_bands + 1, activation="sigmoid"
+                ),  # +1は全体ゲイン
             ],
             name="noise_intensity",
         )
@@ -177,11 +179,14 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
             band_envelopes, axis=2
         )  # [batch, time, num_bands]
 
-        # 音色から各帯域のノイズ強度
+        # 音色から各帯域のノイズ強度 + 全体ゲイン
         timbre = cond[:, 1:]
-        noise_intensities = self.noise_intensity_net(
-            timbre
-        )  # [batch, num_bands]
+        noise_params = self.noise_intensity_net(timbre)  # [batch, num_bands+1]
+
+        noise_intensities = noise_params[:, : self.num_bands]  # 各帯域
+        global_noise_gain = noise_params[
+            :, self.num_bands : self.num_bands + 1
+        ]  # 全体ゲイン
 
         # 各帯域のノイズを生成・合成
         total_noise = tf.zeros([batch_size, self.output_length])
@@ -204,8 +209,9 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
             band_noise = filtered * band_env * intensity * freq_boost
             total_noise = total_noise + band_noise
 
-        # 正規化
+        # 正規化と全体ゲイン適用
         total_noise = total_noise / float(self.num_bands)
+        total_noise = total_noise * global_noise_gain * 1.5  # ★音色別に調整可能
 
         return total_noise
 
@@ -479,7 +485,7 @@ class ThicknessGenerator(tf.keras.layers.Layer):
 
 
 # ========================================
-# 既存レイヤー（変更なし）
+# 改良版TimbreEnvelopeShaper（音色別の柔軟性向上）
 # ========================================
 class TimbreEnvelopeShaper(tf.keras.layers.Layer):
     def __init__(self):
@@ -490,7 +496,9 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
                 tf.keras.layers.Dense(128, activation="relu"),
                 tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(3, activation="sigmoid"),
+                tf.keras.layers.Dense(
+                    4, activation="sigmoid"
+                ),  # ★4パラメータに増加
             ],
             name="adsr_param_net",
         )
@@ -513,6 +521,9 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         attack_speed = adsr_params[:, 0:1] * 25.0 + 1.0
         decay_rate = adsr_params[:, 1:2] * 20.0 + 0.5
         sustain_level = adsr_params[:, 2:3] * 0.9 + 0.05
+        sustain_duration = (
+            adsr_params[:, 3:4] * 0.5 + 0.2
+        )  # ★新規: サステイン長さ
 
         lfo_params = self.lfo_param_net(combined_input)
         lfo_rate = lfo_params[:, 0:1] * 8.0 + 1.0
@@ -537,13 +548,20 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
             1.0 - tf.exp(-decay_rate * decay_t)
         )
 
-        release_mask = tf.cast(t >= decay_end, tf.float32)
-        release_t = (t - decay_end) / (1.0 - decay_end + 1e-6)
+        # ★サステイン期間を可変に
+        sustain_end = decay_end + sustain_duration[:, 0:1]
+        sustain_mask = tf.cast((t >= decay_end) & (t < sustain_end), tf.float32)
+        sustain_curve = sustain_level
+
+        # リリース
+        release_mask = tf.cast(t >= sustain_end, tf.float32)
+        release_t = (t - sustain_end) / (1.0 - sustain_end + 1e-6)
         release_curve = sustain_level * tf.exp(-decay_rate * release_t)
 
         envelope_shape = (
             attack_mask * attack_curve
             + decay_mask * decay_curve
+            + sustain_mask * sustain_curve  # ★サステイン追加
             + release_mask * release_curve
         )
 
@@ -697,7 +715,7 @@ def sample_z(z_mean, z_logvar):
 
 
 # ========================================
-# 改良版Decoder: 適応的ノイズと周波数帯域制御
+# 改良版Decoder: ノイズとエンベロープを音色別に最適化
 # ========================================
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
@@ -716,11 +734,11 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     envelope_net = EnvelopeNet()
     base_envelope, z_envelope_features = envelope_net(z_in, cond)
 
-    # 音色によるエンベロープシェイピング
+    # 音色によるエンベロープシェイピング（改良版）
     envelope_shaper = TimbreEnvelopeShaper()
     envelope = envelope_shaper(base_envelope, timbre, z_envelope_features)
 
-    # ★適応的ノイズ生成（周波数帯域別）
+    # ★適応的ノイズ生成（音色別に自動調整）
     adaptive_noise_gen = AdaptiveNoiseGenerator(num_bands=4)
     noise = adaptive_noise_gen(z_in, cond)
 
@@ -748,8 +766,8 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         base_harmonic_wave, z_in, cond, fundamental_freq
     )
 
-    # 最終合成（ノイズの比率を増加）
-    output = thick_harmonic_wave * envelope + noise * 1.5  # ノイズを1.5倍に
+    # ★最終合成（ノイズは音色別に調整されるので固定倍率は削除）
+    output = thick_harmonic_wave * envelope + noise
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
 
@@ -819,7 +837,6 @@ class TimeWiseCVAE(tf.keras.Model):
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
-            # ★新しい損失項
             # 高周波強調損失
             high_freq_loss = compute_high_freq_emphasis_loss(x_target, x_hat_sq)
 
@@ -836,13 +853,13 @@ class TimeWiseCVAE(tf.keras.Model):
 
             kl_weight = self.compute_kl_weight()
 
-            # 総合損失（高周波・スペクトルフラックス項を追加）
+            # 総合損失
             loss = (
                 recon * 25.0
                 + stft_loss * 12.0
                 + mel_loss * 10.0
-                + high_freq_loss * 15.0  # 高周波損失
-                + spectral_flux_loss * 8.0  # スペクトルフラックス損失
+                + high_freq_loss * 15.0
+                + spectral_flux_loss * 8.0
                 + kl_divergence * kl_weight
             )
 
