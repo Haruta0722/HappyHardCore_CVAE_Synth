@@ -20,6 +20,335 @@ LATENT_STEPS = TIME_LENGTH // 64
 
 
 # ========================================
+# 高周波・スペクトルフラックス損失
+# ========================================
+def compute_spectral_flux_loss(
+    y_true, y_pred, frame_length=2048, hop_length=512
+):
+    """
+    スペクトルフラックスの差を損失として計算
+    screech特有の時間変化を学習
+    """
+
+    def get_spectral_flux(audio):
+        # STFT
+        stft = tf.signal.stft(
+            audio,
+            frame_length=frame_length,
+            frame_step=hop_length,
+            fft_length=frame_length,
+        )
+        magnitude = tf.abs(stft)
+
+        # フレーム間の差分
+        diff = magnitude[:, 1:, :] - magnitude[:, :-1, :]
+        # 正の変化のみ考慮（増加のみ）
+        diff = tf.maximum(diff, 0.0)
+
+        # 時間軸で平均
+        flux = tf.reduce_mean(diff, axis=-1)  # [batch, frames-1]
+        return flux
+
+    flux_true = get_spectral_flux(y_true)
+    flux_pred = get_spectral_flux(y_pred)
+
+    # L1距離
+    loss = tf.reduce_mean(tf.abs(flux_true - flux_pred))
+    return loss
+
+
+def compute_high_freq_emphasis_loss(y_true, y_pred, sr=SR, cutoff_freq=2000.0):
+    """
+    高周波帯域のエネルギー差を重視した損失
+    screechの高周波成分を強化
+    """
+    # STFT
+    stft_true = tf.signal.stft(
+        y_true, frame_length=2048, frame_step=512, fft_length=2048
+    )
+    stft_pred = tf.signal.stft(
+        y_pred, frame_length=2048, frame_step=512, fft_length=2048
+    )
+
+    mag_true = tf.abs(stft_true)
+    mag_pred = tf.abs(stft_pred)
+
+    # 周波数ビンのインデックス
+    num_bins = tf.shape(mag_true)[-1]
+    freq_bins = (
+        tf.cast(tf.range(num_bins), tf.float32)
+        * (sr / 2.0)
+        / tf.cast(num_bins, tf.float32)
+    )
+
+    # 高周波の重み（2kHz以上を強調）
+    high_freq_weight = tf.sigmoid(
+        (freq_bins - cutoff_freq) / 500.0
+    )  # [num_bins]
+    high_freq_weight = tf.reshape(high_freq_weight, [1, 1, -1])
+
+    # 重み付き損失
+    weighted_diff = tf.square(mag_true - mag_pred) * (
+        1.0 + high_freq_weight * 5.0
+    )
+    loss = tf.reduce_mean(weighted_diff)
+
+    return loss
+
+
+# ========================================
+# 適応的ノイズジェネレータ（周波数帯域別）
+# ========================================
+class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
+    """
+    周波数帯域別にノイズを生成
+    screech特有のざらついた高周波ノイズを学習
+    """
+
+    def __init__(self, output_length=TIME_LENGTH, num_bands=4):
+        super().__init__()
+        self.output_length = output_length
+        self.num_bands = num_bands
+
+        # 各周波数帯域のノイズエンベロープ
+        self.band_envelope_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    128, 7, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    num_bands, 3, padding="same", activation="sigmoid"
+                ),
+            ],
+            name="band_envelopes",
+        )
+
+        # 各帯域のフィルタ特性
+        self.band_filters = []
+        for i in range(num_bands):
+            self.band_filters.append(
+                tf.keras.Sequential(
+                    [
+                        tf.keras.layers.Conv1D(
+                            16, 15, padding="same", activation="relu"
+                        ),
+                        tf.keras.layers.Conv1D(
+                            8, 9, padding="same", activation="relu"
+                        ),
+                        tf.keras.layers.Conv1D(
+                            1, 5, padding="same", activation="tanh"
+                        ),
+                    ],
+                    name=f"band_filter_{i}",
+                )
+            )
+
+        # 全体のノイズ量を学習（音色から）
+        self.noise_intensity_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Dense(64, activation="relu"),
+                tf.keras.layers.Dense(32, activation="relu"),
+                tf.keras.layers.Dense(num_bands, activation="sigmoid"),
+            ],
+            name="noise_intensity",
+        )
+
+    def call(self, z, cond):
+        batch_size = tf.shape(z)[0]
+        latent_steps = tf.shape(z)[1]
+
+        # 条件をブロードキャスト
+        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
+        z_cond = tf.concat([z, cond_broadcast], axis=-1)
+
+        # 各帯域のエンベロープ
+        band_envelopes = self.band_envelope_net(
+            z_cond
+        )  # [batch, latent_steps, num_bands]
+        band_envelopes = tf.image.resize(
+            tf.expand_dims(band_envelopes, axis=2),
+            [self.output_length, 1],
+            method="bilinear",
+        )
+        band_envelopes = tf.squeeze(
+            band_envelopes, axis=2
+        )  # [batch, time, num_bands]
+
+        # 音色から各帯域のノイズ強度
+        timbre = cond[:, 1:]
+        noise_intensities = self.noise_intensity_net(
+            timbre
+        )  # [batch, num_bands]
+
+        # 各帯域のノイズを生成・合成
+        total_noise = tf.zeros([batch_size, self.output_length])
+
+        for i in range(self.num_bands):
+            # ホワイトノイズ
+            raw_noise = tf.random.normal([batch_size, self.output_length, 1])
+
+            # 帯域フィルタリング
+            filtered = self.band_filters[i](raw_noise)
+            filtered = tf.squeeze(filtered, axis=-1)
+
+            # エンベロープと強度を適用
+            band_env = band_envelopes[:, :, i]
+            intensity = noise_intensities[:, i : i + 1]
+
+            # 高周波帯域ほど強く（screech特性）
+            freq_boost = 1.0 + (i / float(self.num_bands)) * 2.0
+
+            band_noise = filtered * band_env * intensity * freq_boost
+            total_noise = total_noise + band_noise
+
+        # 正規化
+        total_noise = total_noise / float(self.num_bands)
+
+        return total_noise
+
+
+# ========================================
+# 周波数帯域別倍音コントローラ
+# ========================================
+class FrequencyBandHarmonicController(tf.keras.layers.Layer):
+    """
+    低・中・高周波帯域で異なる倍音制御
+    screechは高周波倍音が強い特性を学習
+    """
+
+    def __init__(self, num_harmonics=NUM_HARMONICS):
+        super().__init__()
+        self.num_harmonics = num_harmonics
+
+        # 低・中・高周波帯域の制御パラメータ
+        self.band_control_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Dense(128, activation="relu"),
+                tf.keras.layers.Dense(64, activation="relu"),
+                tf.keras.layers.Dense(
+                    3, activation="sigmoid"
+                ),  # [low_gain, mid_gain, high_gain]
+            ],
+            name="band_control",
+        )
+
+    def call(self, amplitudes, timbre, z_features):
+        """
+        Args:
+            amplitudes: [batch, time_length, num_harmonics]
+            timbre: [batch, 3]
+            z_features: [batch, feature_dim]
+        """
+        # 音色とzから帯域ゲインを計算
+        combined = tf.concat([z_features, timbre], axis=-1)
+        band_gains = self.band_control_net(combined)  # [batch, 3]
+
+        low_gain = band_gains[:, 0:1]
+        mid_gain = band_gains[:, 1:2]
+        high_gain = band_gains[:, 2:3]
+
+        # 倍音インデックス
+        harmonic_indices = tf.cast(
+            tf.range(1, self.num_harmonics + 1), tf.float32
+        )
+
+        # 各倍音を周波数帯域に分類
+        # 低域: 1-8, 中域: 9-20, 高域: 21-32
+        low_mask = tf.cast(harmonic_indices <= 8, tf.float32)
+        mid_mask = tf.cast(
+            (harmonic_indices > 8) & (harmonic_indices <= 20), tf.float32
+        )
+        high_mask = tf.cast(harmonic_indices > 20, tf.float32)
+
+        # 各帯域のゲインを適用
+        gain_profile = (
+            low_mask * low_gain[:, :, None]
+            + mid_mask * mid_gain[:, :, None]
+            + high_mask * high_gain[:, :, None] * 2.0  # 高域を2倍強調
+        )
+
+        gain_profile = tf.reshape(gain_profile, [-1, 1, self.num_harmonics])
+
+        # 適用
+        controlled_amps = amplitudes * (0.5 + gain_profile)
+
+        return controlled_amps
+
+
+# ========================================
+# 改良版HarmonicAmplitudeNet
+# ========================================
+class HarmonicAmplitudeNet(tf.keras.layers.Layer):
+    def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
+        super().__init__()
+        self.num_harmonics = num_harmonics
+        self.output_length = output_length
+
+        self.net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Conv1D(
+                    256, 9, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    256, 7, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    128, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    64, 5, padding="same", activation="relu"
+                ),
+                tf.keras.layers.Conv1D(
+                    num_harmonics, 3, padding="same", activation="sigmoid"
+                ),
+            ]
+        )
+
+        # zから特徴を抽出
+        self.z_feature_extractor = tf.keras.Sequential(
+            [
+                tf.keras.layers.GlobalAveragePooling1D(),
+                tf.keras.layers.Dense(64, activation="relu"),
+            ],
+            name="z_features",
+        )
+
+        # 周波数帯域別制御
+        self.band_controller = FrequencyBandHarmonicController(num_harmonics)
+
+    def call(self, z, cond):
+        batch_size = tf.shape(z)[0]
+        latent_steps = tf.shape(z)[1]
+
+        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
+        z_cond = tf.concat([z, cond_broadcast], axis=-1)
+
+        amps = self.net(z_cond)
+        amps = tf.keras.layers.Lambda(
+            lambda v: tf.squeeze(
+                tf.image.resize(
+                    tf.expand_dims(v, axis=2),
+                    [self.output_length, 1],
+                    method="bilinear",
+                ),
+                axis=2,
+            )
+        )(amps)
+
+        # zから特徴を抽出
+        z_features = self.z_feature_extractor(z)
+
+        # 周波数帯域別制御
+        timbre = cond[:, 1:]
+        amps = self.band_controller(amps, timbre, z_features)
+
+        return amps
+
+
+# ========================================
 # ThicknessGenerator: 音の厚みを生成
 # ========================================
 class ThicknessGenerator(tf.keras.layers.Layer):
@@ -75,7 +404,7 @@ class ThicknessGenerator(tf.keras.layers.Layer):
             thick_harmonics: 厚みのある倍音波形 [batch, time_length]
         """
         batch_size = tf.shape(base_harmonics)[0]
-        time_length = tf.shape(base_harmonics)[0]
+        time_length = tf.shape(base_harmonics)[1]
 
         # 音色から厚みパラメータを取得
         timbre = cond[:, 1:]
@@ -147,55 +476,6 @@ class ThicknessGenerator(tf.keras.layers.Layer):
         thick_output = thick_output / float(self.num_voices)
 
         return thick_output
-
-
-# ========================================
-# 改良版HighFrequencyEmphasis
-# ========================================
-class HighFrequencyEmphasis(tf.keras.layers.Layer):
-    """
-    screech用: zからの情報も使って高周波を強調
-    """
-
-    def __init__(self, num_harmonics=NUM_HARMONICS):
-        super().__init__()
-        self.num_harmonics = num_harmonics
-
-        # zと音色の両方から高周波プロファイルを生成
-        self.hf_profile_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(128, activation="relu"),
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(num_harmonics, activation="sigmoid"),
-            ],
-            name="hf_profile",
-        )
-
-    def call(self, amplitudes, timbre, z_features):
-        """
-        Args:
-            amplitudes: [batch, time_length, num_harmonics]
-            timbre: [batch, 3]
-            z_features: [batch, feature_dim] - zから抽出した特徴
-        """
-        # zと音色を結合
-        combined = tf.concat([z_features, timbre], axis=-1)
-        hf_profile = self.hf_profile_net(combined)
-
-        # 高次倍音の強調カーブ
-        harmonic_indices = tf.range(1, self.num_harmonics + 1, dtype=tf.float32)
-
-        # screech用: より緩やかな減衰（h^0.2）
-        hf_curve = tf.pow(harmonic_indices / float(self.num_harmonics), 0.2)
-        hf_curve = tf.reshape(hf_curve, [1, 1, self.num_harmonics])
-
-        hf_profile_expanded = hf_profile[:, None, :]
-
-        # 強調を適用（より強い強調）
-        emphasis_factor = 1.0 + hf_profile_expanded * hf_curve * 3.0
-        emphasized_amps = amplitudes * emphasis_factor
-
-        return emphasized_amps
 
 
 # ========================================
@@ -387,150 +667,6 @@ class EnvelopeNet(tf.keras.layers.Layer):
         return tf.squeeze(x, axis=-1), self.global_features
 
 
-# ========================================
-# 改良版HarmonicAmplitudeNet
-# ========================================
-class HarmonicAmplitudeNet(tf.keras.layers.Layer):
-    def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
-        super().__init__()
-        self.num_harmonics = num_harmonics
-        self.output_length = output_length
-
-        self.net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Conv1D(
-                    256, 9, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    256, 7, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    128, 5, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    64, 5, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    num_harmonics, 3, padding="same", activation="sigmoid"
-                ),
-            ]
-        )
-
-        # zから特徴を抽出
-        self.z_feature_extractor = tf.keras.Sequential(
-            [
-                tf.keras.layers.GlobalAveragePooling1D(),
-                tf.keras.layers.Dense(64, activation="relu"),
-            ],
-            name="z_features",
-        )
-
-        # 改良版高周波強調
-        self.hf_emphasis = HighFrequencyEmphasis(num_harmonics)
-
-    def call(self, z, cond):
-        batch_size = tf.shape(z)[0]
-        latent_steps = tf.shape(z)[1]
-
-        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
-        z_cond = tf.concat([z, cond_broadcast], axis=-1)
-
-        amps = self.net(z_cond)
-        amps = tf.keras.layers.Lambda(
-            lambda v: tf.squeeze(
-                tf.image.resize(
-                    tf.expand_dims(v, axis=2),
-                    [self.output_length, 1],
-                    method="bilinear",
-                ),
-                axis=2,
-            )
-        )(amps)
-
-        # zから特徴を抽出
-        z_features = self.z_feature_extractor(z)
-
-        # 高周波強調（zの情報も使う）
-        timbre = cond[:, 1:]
-        amps = self.hf_emphasis(amps, timbre, z_features)
-
-        return amps
-
-
-class NoiseGenerator(tf.keras.layers.Layer):
-    def __init__(self, output_length=TIME_LENGTH):
-        super().__init__()
-        self.output_length = output_length
-
-        self.envelope_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Conv1D(
-                    64, 7, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    32, 5, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    1, 3, padding="same", activation="sigmoid"
-                ),
-            ]
-        )
-
-        self.filter_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Conv1D(
-                    32, 9, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(
-                    16, 7, padding="same", activation="relu"
-                ),
-                tf.keras.layers.Conv1D(8, 5, padding="same", activation="relu"),
-                tf.keras.layers.Conv1D(1, 3, padding="same", activation="tanh"),
-            ]
-        )
-
-        self.noise_amount_net = tf.keras.Sequential(
-            [
-                tf.keras.layers.Dense(64, activation="relu"),
-                tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(1, activation="sigmoid"),
-            ],
-            name="noise_amount_net",
-        )
-
-    def call(self, z, cond):
-        latent_steps = tf.shape(z)[1]
-        cond_broadcast = tf.tile(cond[:, None, :], [1, latent_steps, 1])
-        z_cond = tf.concat([z, cond_broadcast], axis=-1)
-
-        noise_env = self.envelope_net(z_cond)
-        noise_env = tf.keras.layers.Lambda(
-            lambda v: tf.squeeze(
-                tf.image.resize(
-                    tf.expand_dims(v, axis=2),
-                    [self.output_length, 1],
-                    method="bilinear",
-                ),
-                axis=2,
-            )
-        )(noise_env)
-
-        batch_size = tf.shape(z)[0]
-        random_noise = tf.random.normal([batch_size, self.output_length, 1])
-        filtered_noise = self.filter_net(random_noise)
-
-        timbre = cond[:, 1:]
-        noise_amount = self.noise_amount_net(timbre)
-
-        # さらに削減（0.02 → 0.01）
-        noise_amount = noise_amount * 0.01
-        noise_amount = noise_amount[:, :, None]
-
-        output = noise_env * filtered_noise * noise_amount
-
-        return tf.squeeze(output, axis=-1)
-
-
 def build_encoder(latent_dim=LATENT_DIM):
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1))
     x = x_in
@@ -561,13 +697,13 @@ def sample_z(z_mean, z_logvar):
 
 
 # ========================================
-# ★改良版Decoder: ThicknessGeneratorを統合
+# 改良版Decoder: 適応的ノイズと周波数帯域制御
 # ========================================
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # 倍音振幅生成（改良版）
+    # 倍音振幅生成（周波数帯域別制御）
     harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
     base_harmonic_amps = harmonic_amp_net(z_in, cond)
 
@@ -584,9 +720,9 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     envelope_shaper = TimbreEnvelopeShaper()
     envelope = envelope_shaper(base_envelope, timbre, z_envelope_features)
 
-    # ノイズ生成
-    noise_gen = NoiseGenerator()
-    noise = noise_gen(z_in, cond)
+    # ★適応的ノイズ生成（周波数帯域別）
+    adaptive_noise_gen = AdaptiveNoiseGenerator(num_bands=4)
+    noise = adaptive_noise_gen(z_in, cond)
 
     # ピッチから基本周波数を計算
     pitch = tf.keras.layers.Lambda(lambda c: c[:, 0])(cond)
@@ -606,14 +742,14 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         [fundamental_freq, shaped_harmonic_amps, phases]
     )
 
-    # ★重要: ThicknessGeneratorで厚みを追加
+    # 厚みを追加
     thickness_gen = ThicknessGenerator(num_voices=3)
     thick_harmonic_wave = thickness_gen(
         base_harmonic_wave, z_in, cond, fundamental_freq
     )
 
-    # 最終合成
-    output = thick_harmonic_wave * envelope + noise
+    # 最終合成（ノイズの比率を増加）
+    output = thick_harmonic_wave * envelope + noise * 1.5  # ノイズを1.5倍に
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
 
@@ -621,7 +757,7 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
 
 
 # ========================================
-# TimeWiseCVAE（Prototypesなし版）
+# TimeWiseCVAE: 高周波・スペクトルフラックス損失を追加
 # ========================================
 class TimeWiseCVAE(tf.keras.Model):
     def __init__(
@@ -651,7 +787,6 @@ class TimeWiseCVAE(tf.keras.Model):
 
     def generate(self, cond):
         """推論用: ゼロベクトルから生成"""
-        # partialモデルなので、ゼロベクトルを使用
         z = tf.zeros((tf.shape(cond)[0], LATENT_STEPS, LATENT_DIM))
         x_hat = self.decoder([z, cond], training=False)
         return x_hat
@@ -676,12 +811,22 @@ class TimeWiseCVAE(tf.keras.Model):
             x_target = tf.squeeze(x, axis=-1)
             x_hat_sq = tf.squeeze(x_hat, axis=-1)
 
+            # 基本的な再構成損失
             recon = tf.reduce_mean(tf.square(x_target - x_hat_sq))
 
+            # 既存のスペクトル損失
             stft_loss, mel_loss, diff_loss = Loss(
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
+            # ★新しい損失項
+            # 高周波強調損失
+            high_freq_loss = compute_high_freq_emphasis_loss(x_target, x_hat_sq)
+
+            # スペクトルフラックス損失
+            spectral_flux_loss = compute_spectral_flux_loss(x_target, x_hat_sq)
+
+            # KL損失
             kl_per_dim = -0.5 * (
                 1 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
             )
@@ -691,10 +836,13 @@ class TimeWiseCVAE(tf.keras.Model):
 
             kl_weight = self.compute_kl_weight()
 
+            # 総合損失（高周波・スペクトルフラックス項を追加）
             loss = (
                 recon * 25.0
                 + stft_loss * 12.0
                 + mel_loss * 10.0
+                + high_freq_loss * 15.0  # 高周波損失
+                + spectral_flux_loss * 8.0  # スペクトルフラックス損失
                 + kl_divergence * kl_weight
             )
 
@@ -712,12 +860,10 @@ class TimeWiseCVAE(tf.keras.Model):
             "best_recon": self.best_recon,
             "stft": stft_loss,
             "mel": mel_loss,
+            "high_freq": high_freq_loss,
+            "spectral_flux": spectral_flux_loss,
             "kl": kl_divergence,
             "kl_weight": kl_weight,
             "z_std_ema": self.z_std_ema,
             "grad_norm": grad_norm,
         }
-
-
-# ========================================
-# 実装のまとめ
