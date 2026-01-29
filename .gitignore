@@ -12,3 +12,5 @@ memo
 /Flutter_app/
 /__pycache__/
 midi_project/__pycache__/
+midi_project/test/
+midi_project/paper_figures/

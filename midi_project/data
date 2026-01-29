@@ -1,0 +1,68 @@
+gen = [
+    "test\pluck\c3_pluck_01.wav",
+    "test\pluck\c3_pluck_02.wav",
+    "test\pluck\c3_pluck_03.wav",
+    "test\pluck\c3_pluck_04.wav",
+    "test\pluck\c3_pluck_05.wav",
+]
+
+gen = [
+    "test\screech\c3_screech_01.wav",
+    "test\screech\c3_screech_02.wav",
+    "test\screech\c3_screech_03.wav",
+    "test\screech\c3_screech_04.wav",
+    "test\screech\c3_screech_05.wav",
+]
+
+gen = [
+    "test\acid\c3_acid_01.wav",
+    "test\acid\c3_acid_02.wav",
+    "test\acid\c3_acid_03.wav",
+    "test\acid\c3_acid_04.wav",
+    "test\acid\c3_acid_05.wav",
+]
+
+
+gt = [
+    "datasets/C3/0001.wav",
+    "datasets/C3/0002.wav",
+    "datasets/C3/0003.wav",
+    "datasets/C3/0004.wav",
+    "datasets/C3/0005.wav",
+    "datasets/C3/0006.wav",
+    "datasets/C3/0007.wav",
+    "datasets/C3/0008.wav",
+    "datasets/C3/0009.wav",
+    "datasets/C3/0010.wav",
+    "datasets/C3/0011.wav",
+]
+
+gt = [
+    "datasets/C3/0012.wav",
+    "datasets/C3/0013.wav",
+    "datasets/C3/0014.wav",
+    "datasets/C3/0015.wav",
+    "datasets/C3/0016.wav",
+    "datasets/C3/0017.wav",
+    "datasets/C3/0018.wav",
+    "datasets/C3/0019.wav",
+    "datasets/C3/0020.wav",
+    "datasets/C3/0021.wav",
+    "datasets/C3/0022.wav",
+    "datasets/C3/0023.wav",
+]
+gt = [
+    "datasets/C3/0024.wav",
+    "datasets/C3/0025.wav",
+    "datasets/C3/0026.wav",
+    "datasets/C3/0027.wav",
+    "datasets/C3/0028.wav",
+    "datasets/C3/0029.wav",
+    "datasets/C3/0030.wav",
+    "datasets/C3/0031.wav",
+    "datasets/C3/0032.wav",
+    "datasets/C3/0033.wav",
+    "datasets/C3/0034.wav",
+    "datasets/C3/0035.wav",
+    "datasets/C3/0036.wav",
+]
