@@ -901,18 +901,24 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     # 倍音:ノイズ = 約 10:1 の比率
     harmonic_component = thick_harmonic_wave * envelope
 
-    # ★NaN防止: クリッピング
-    harmonic_component = tf.clip_by_value(harmonic_component, -10.0, 10.0)
+    # ★NaN防止: クリッピング（Lambdaレイヤーでラップ）
+    harmonic_component = tf.keras.layers.Lambda(
+        lambda x: tf.clip_by_value(x, -10.0, 10.0)
+    )(harmonic_component)
 
     noise_component = noise * 0.1  # ノイズを10%に抑制
 
-    # ★NaN防止: クリッピング
-    noise_component = tf.clip_by_value(noise_component, -1.0, 1.0)
+    # ★NaN防止: クリッピング（Lambdaレイヤーでラップ）
+    noise_component = tf.keras.layers.Lambda(
+        lambda x: tf.clip_by_value(x, -1.0, 1.0)
+    )(noise_component)
 
     output = harmonic_component + noise_component
 
-    # ★NaN防止: tanh前にクリッピング
-    output = tf.clip_by_value(output, -10.0, 10.0)
+    # ★NaN防止: tanh前にクリッピング（Lambdaレイヤーでラップ）
+    output = tf.keras.layers.Lambda(lambda x: tf.clip_by_value(x, -10.0, 10.0))(
+        output
+    )
 
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
