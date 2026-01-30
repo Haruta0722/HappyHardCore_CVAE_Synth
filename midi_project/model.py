@@ -180,9 +180,15 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
             band_envelopes, axis=2
         )  # [batch, time, num_bands]
 
+        # ★NaN防止: クリッピング
+        band_envelopes = tf.clip_by_value(band_envelopes, 0.0, 1.0)
+
         # 音色から各帯域のノイズ強度 + 全体ゲイン
         timbre = cond[:, 1:]
         noise_params = self.noise_intensity_net(timbre)  # [batch, num_bands+1]
+
+        # ★NaN防止: クリッピング
+        noise_params = tf.clip_by_value(noise_params, 0.0, 1.0)
 
         noise_intensities = noise_params[:, : self.num_bands]  # 各帯域
         global_noise_gain = noise_params[
@@ -200,6 +206,9 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
             filtered = self.band_filters[i](raw_noise)
             filtered = tf.squeeze(filtered, axis=-1)
 
+            # ★NaN防止: クリッピング
+            filtered = tf.clip_by_value(filtered, -10.0, 10.0)
+
             # エンベロープと強度を適用
             band_env = band_envelopes[:, :, i]
             intensity = noise_intensities[:, i : i + 1]
@@ -213,7 +222,10 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
         # 正規化と全体ゲイン適用
         total_noise = total_noise / float(self.num_bands)
         # ★全体的なノイズレベルを削減（1.5 → 0.8）
-        total_noise = total_noise * global_noise_gain * 0.8
+        total_noise = total_noise * global_noise_gain * 0.5  # 0.8 → 0.5
+
+        # ★NaN防止: 最終クリッピング
+        total_noise = tf.clip_by_value(total_noise, -1.0, 1.0)
 
         return total_noise
 
@@ -255,6 +267,9 @@ class OddHarmonicEnhancer(tf.keras.layers.Layer):
         # 音色から奇数倍音強調度を取得
         odd_strength = self.odd_enhancement_net(timbre)  # [batch, 1]
 
+        # ★NaN防止: クリッピング
+        odd_strength = tf.clip_by_value(odd_strength, 0.0, 1.0)
+
         # 倍音インデックス (1, 2, 3, ...)
         harmonic_indices = tf.range(1, self.num_harmonics + 1, dtype=tf.float32)
 
@@ -268,10 +283,16 @@ class OddHarmonicEnhancer(tf.keras.layers.Layer):
             1.0 - is_odd
         ) * (1.0 - 0.5 * odd_strength[:, :, None])
 
+        # ★NaN防止: プロファイルを安全な範囲に制限
+        odd_profile = tf.clip_by_value(odd_profile, 0.3, 2.5)
+
         odd_profile = tf.reshape(odd_profile, [-1, 1, self.num_harmonics])
 
         # 適用
         enhanced_amps = amplitudes * odd_profile
+
+        # ★NaN防止: 出力を制限
+        enhanced_amps = tf.clip_by_value(enhanced_amps, 0.0, 2.0)
 
         return enhanced_amps
 
@@ -312,6 +333,9 @@ class FrequencyBandHarmonicController(tf.keras.layers.Layer):
         combined = tf.concat([z_features, timbre], axis=-1)
         band_gains = self.band_control_net(combined)  # [batch, 3]
 
+        # ★NaN防止: クリッピング
+        band_gains = tf.clip_by_value(band_gains, 0.0, 1.0)
+
         low_gain = band_gains[:, 0:1]
         mid_gain = band_gains[:, 1:2]
         high_gain = band_gains[:, 2:3]
@@ -338,8 +362,14 @@ class FrequencyBandHarmonicController(tf.keras.layers.Layer):
 
         gain_profile = tf.reshape(gain_profile, [-1, 1, self.num_harmonics])
 
+        # ★NaN防止: ゲインプロファイルを制限
+        gain_profile = tf.clip_by_value(gain_profile, 0.0, 1.5)
+
         # 適用
         controlled_amps = amplitudes * (0.5 + gain_profile)
+
+        # ★NaN防止: 出力を制限
+        controlled_amps = tf.clip_by_value(controlled_amps, 0.0, 2.0)
 
         return controlled_amps
 
@@ -482,6 +512,9 @@ class ThicknessGenerator(tf.keras.layers.Layer):
         timbre = cond[:, 1:]
         thickness_params = self.thickness_param_net(timbre)
 
+        # ★NaN防止: クリッピング
+        thickness_params = tf.clip_by_value(thickness_params, 0.0, 1.0)
+
         detune_amount = thickness_params[:, 0:1] * 0.02  # 最大2%
         spread_amount = thickness_params[:, 1:2] * 0.5
         phase_mod_depth = thickness_params[:, 2:3] * 0.3
@@ -504,6 +537,9 @@ class ThicknessGenerator(tf.keras.layers.Layer):
         voice_envelopes = tf.squeeze(
             voice_envelopes, axis=2
         )  # [batch, time_length, num_voices]
+
+        # ★NaN防止: クリッピング
+        voice_envelopes = tf.clip_by_value(voice_envelopes, 0.0, 1.0)
 
         # 複数ボイスを生成
         thick_output = tf.zeros_like(base_harmonics)
@@ -532,8 +568,14 @@ class ThicknessGenerator(tf.keras.layers.Layer):
             )
             phase_lfo = phase_lfo[:, :TIME_LENGTH]
 
+            # ★NaN防止: クリッピング
+            phase_lfo = tf.clip_by_value(phase_lfo, -1.0, 1.0)
+
             # 簡易的な位相変調（振幅変調で近似）
             modulated = shifted_harmonics * (1.0 + phase_lfo * 0.1)
+
+            # ★NaN防止: クリッピング
+            modulated = tf.clip_by_value(modulated, -10.0, 10.0)
 
             # ボイスエンベロープを適用
             voice_env = voice_envelopes[:, :, voice_idx]
@@ -542,10 +584,16 @@ class ThicknessGenerator(tf.keras.layers.Layer):
             pan = (voice_idx - (self.num_voices - 1) / 2) / self.num_voices
             pan_weight = 1.0 - tf.abs(pan) * spread_amount[:, 0:1]
 
+            # ★NaN防止: クリッピング
+            pan_weight = tf.clip_by_value(pan_weight, 0.0, 1.0)
+
             thick_output += modulated * voice_env * pan_weight
 
         # 正規化
         thick_output = thick_output / float(self.num_voices)
+
+        # ★NaN防止: 最終クリッピング
+        thick_output = tf.clip_by_value(thick_output, -10.0, 10.0)
 
         return thick_output
 
@@ -582,12 +630,20 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         )
 
         adsr_params = self.adsr_param_net(combined_input)
+
+        # ★NaN防止: クリッピング
+        adsr_params = tf.clip_by_value(adsr_params, 0.0, 1.0)
+
         attack_speed = adsr_params[:, 0:1] * 25.0 + 1.0
         decay_rate = adsr_params[:, 1:2] * 20.0 + 0.5
         sustain_level = adsr_params[:, 2:3] * 0.9 + 0.05
         sustain_duration = adsr_params[:, 3:4] * 0.5 + 0.2
 
         lfo_params = self.lfo_param_net(combined_input)
+
+        # ★NaN防止: クリッピング
+        lfo_params = tf.clip_by_value(lfo_params, 0.0, 1.0)
+
         lfo_rate = lfo_params[:, 0:1] * 8.0 + 1.0
         lfo_depth = lfo_params[:, 1:2] * 0.6
 
@@ -601,13 +657,17 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         decay_ratio = 0.22
 
         attack_mask = tf.cast(t < attack_ratio, tf.float32)
-        attack_curve = (t / (attack_ratio + 1e-6)) ** (1.0 / attack_speed)
+        # ★NaN防止: ゼロ除算対策とクリッピング
+        attack_curve = tf.pow(
+            tf.clip_by_value(t / (attack_ratio + 1e-6), 0.0, 1.0),
+            1.0 / tf.clip_by_value(attack_speed, 0.1, 50.0),
+        )
 
         decay_end = attack_ratio + decay_ratio
         decay_mask = tf.cast((t >= attack_ratio) & (t < decay_end), tf.float32)
         decay_t = (t - attack_ratio) / (decay_ratio + 1e-6)
         decay_curve = 1.0 - (1.0 - sustain_level) * (
-            1.0 - tf.exp(-decay_rate * decay_t)
+            1.0 - tf.exp(-tf.clip_by_value(decay_rate, 0.1, 50.0) * decay_t)
         )
 
         sustain_end = decay_end + sustain_duration[:, 0:1]
@@ -616,7 +676,9 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
 
         release_mask = tf.cast(t >= sustain_end, tf.float32)
         release_t = (t - sustain_end) / (1.0 - sustain_end + 1e-6)
-        release_curve = sustain_level * tf.exp(-decay_rate * release_t)
+        release_curve = sustain_level * tf.exp(
+            -tf.clip_by_value(decay_rate, 0.1, 50.0) * release_t
+        )
 
         envelope_shape = (
             attack_mask * attack_curve
@@ -625,13 +687,22 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
             + release_mask * release_curve
         )
 
+        # ★NaN防止: クリッピング
+        envelope_shape = tf.clip_by_value(envelope_shape, 0.0, 1.0)
+
         t_seconds = t * WAV_LENGTH
         lfo_modulation = 1.0 + lfo_depth * tf.sin(
             2.0 * np.pi * lfo_rate * t_seconds
         )
 
+        # ★NaN防止: クリッピング
+        lfo_modulation = tf.clip_by_value(lfo_modulation, 0.3, 1.7)
+
         final_envelope = base_envelope * 0.3 + envelope_shape * 0.7
         final_envelope = final_envelope * lfo_modulation
+
+        # ★NaN防止: 最終クリッピング
+        final_envelope = tf.clip_by_value(final_envelope, 0.0, 1.5)
 
         return final_envelope
 
@@ -829,9 +900,20 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     # ★最終合成: 倍音を優先し、ノイズは控えめに混ぜる
     # 倍音:ノイズ = 約 10:1 の比率
     harmonic_component = thick_harmonic_wave * envelope
+
+    # ★NaN防止: クリッピング
+    harmonic_component = tf.clip_by_value(harmonic_component, -10.0, 10.0)
+
     noise_component = noise * 0.1  # ノイズを10%に抑制
 
+    # ★NaN防止: クリッピング
+    noise_component = tf.clip_by_value(noise_component, -1.0, 1.0)
+
     output = harmonic_component + noise_component
+
+    # ★NaN防止: tanh前にクリッピング
+    output = tf.clip_by_value(output, -10.0, 10.0)
+
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
 
@@ -885,7 +967,14 @@ class TimeWiseCVAE(tf.keras.Model):
 
         with tf.GradientTape() as tape:
             z_mean, z_logvar = self.encoder(x, training=True)
+
+            # ★NaN防止: z_logvarをクリッピング
+            z_logvar = tf.clip_by_value(z_logvar, -8.0, 2.0)
+
             z = sample_z(z_mean, z_logvar)
+
+            # ★NaN防止: zをクリッピング
+            z = tf.clip_by_value(z, -10.0, 10.0)
 
             x_hat = self.decoder([z, cond], training=True)
             x_hat = x_hat[:, :TIME_LENGTH, :]
@@ -893,19 +982,49 @@ class TimeWiseCVAE(tf.keras.Model):
             x_target = tf.squeeze(x, axis=-1)
             x_hat_sq = tf.squeeze(x_hat, axis=-1)
 
+            # ★NaN防止: 入力と出力をクリッピング
+            x_target = tf.clip_by_value(x_target, -1.0, 1.0)
+            x_hat_sq = tf.clip_by_value(x_hat_sq, -1.0, 1.0)
+
             # 基本的な再構成損失
             recon = tf.reduce_mean(tf.square(x_target - x_hat_sq))
+
+            # ★NaN防止: 再構成損失をチェック
+            recon = tf.where(tf.math.is_nan(recon), 1.0, recon)
+            recon = tf.where(tf.math.is_inf(recon), 1.0, recon)
 
             # 既存のスペクトル損失
             stft_loss, mel_loss, diff_loss = Loss(
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
+            # ★NaN防止: スペクトル損失をチェック
+            stft_loss = tf.where(tf.math.is_nan(stft_loss), 1.0, stft_loss)
+            stft_loss = tf.where(tf.math.is_inf(stft_loss), 1.0, stft_loss)
+            mel_loss = tf.where(tf.math.is_nan(mel_loss), 1.0, mel_loss)
+            mel_loss = tf.where(tf.math.is_inf(mel_loss), 1.0, mel_loss)
+
             # 高周波強調損失（screechの高周波特性のため）
             high_freq_loss = compute_high_freq_emphasis_loss(x_target, x_hat_sq)
 
+            # ★NaN防止
+            high_freq_loss = tf.where(
+                tf.math.is_nan(high_freq_loss), 1.0, high_freq_loss
+            )
+            high_freq_loss = tf.where(
+                tf.math.is_inf(high_freq_loss), 1.0, high_freq_loss
+            )
+
             # スペクトルフラックス損失
             spectral_flux_loss = compute_spectral_flux_loss(x_target, x_hat_sq)
+
+            # ★NaN防止
+            spectral_flux_loss = tf.where(
+                tf.math.is_nan(spectral_flux_loss), 0.1, spectral_flux_loss
+            )
+            spectral_flux_loss = tf.where(
+                tf.math.is_inf(spectral_flux_loss), 0.1, spectral_flux_loss
+            )
 
             # KL損失
             kl_per_dim = -0.5 * (
@@ -914,6 +1033,15 @@ class TimeWiseCVAE(tf.keras.Model):
             kl_divergence = tf.reduce_mean(
                 tf.maximum(kl_per_dim, self.free_bits)
             )
+
+            # ★NaN防止
+            kl_divergence = tf.where(
+                tf.math.is_nan(kl_divergence), 0.5, kl_divergence
+            )
+            kl_divergence = tf.where(
+                tf.math.is_inf(kl_divergence), 0.5, kl_divergence
+            )
+            kl_divergence = tf.clip_by_value(kl_divergence, 0.0, 10.0)
 
             kl_weight = self.compute_kl_weight()
 
@@ -927,11 +1055,44 @@ class TimeWiseCVAE(tf.keras.Model):
                 + kl_divergence * kl_weight
             )
 
+            # ★NaN防止: 総合損失をチェック
+            loss = tf.where(tf.math.is_nan(loss), 1000.0, loss)
+            loss = tf.where(tf.math.is_inf(loss), 1000.0, loss)
+
         grads = tape.gradient(loss, self.trainable_variables)
+
+        # ★NaN防止: 勾配をチェック
+        grads = [
+            (
+                tf.where(tf.math.is_nan(g), tf.zeros_like(g), g)
+                if g is not None
+                else None
+            )
+            for g in grads
+        ]
+        grads = [
+            (
+                tf.where(tf.math.is_inf(g), tf.zeros_like(g), g)
+                if g is not None
+                else None
+            )
+            for g in grads
+        ]
+
         grads, grad_norm = tf.clip_by_global_norm(grads, 5.0)
+
+        # ★NaN防止: grad_normをチェック
+        grad_norm = tf.where(tf.math.is_nan(grad_norm), 0.0, grad_norm)
+        grad_norm = tf.where(tf.math.is_inf(grad_norm), 0.0, grad_norm)
+
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
         z_std = tf.reduce_mean(tf.math.reduce_std(z_mean, axis=1))
+
+        # ★NaN防止
+        z_std = tf.where(tf.math.is_nan(z_std), 1.0, z_std)
+        z_std = tf.where(tf.math.is_inf(z_std), 1.0, z_std)
+
         self.z_std_ema.assign(0.99 * self.z_std_ema + 0.01 * z_std)
         self.best_recon.assign(tf.minimum(self.best_recon, recon))
 
