@@ -97,12 +97,13 @@ def compute_high_freq_emphasis_loss(y_true, y_pred, sr=SR, cutoff_freq=2000.0):
 
 
 # ========================================
-# 適応的ノイズジェネレータ（音色別に調整）
+# ★改良版: 適応的ノイズジェネレータ（倍音構造を保護）
 # ========================================
 class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
     """
     周波数帯域別にノイズを生成
     音色ごとに最適なノイズ量を自動調整（pluckは少なく）
+    ★倍音構造を破壊しないように、ノイズを倍音の「隙間」に配置
     """
 
     def __init__(self, output_length=TIME_LENGTH, num_bands=4):
@@ -146,7 +147,7 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
                 )
             )
 
-        # 全体のノイズ量を学習（音色から）★より柔軟に
+        # ★全体のノイズ量を学習（音色から）- より控えめに
         self.noise_intensity_net = tf.keras.Sequential(
             [
                 tf.keras.layers.Dense(64, activation="relu"),
@@ -203,17 +204,76 @@ class AdaptiveNoiseGenerator(tf.keras.layers.Layer):
             band_env = band_envelopes[:, :, i]
             intensity = noise_intensities[:, i : i + 1]
 
-            # 高周波帯域ほど強く（screech特性）
-            freq_boost = 1.0 + (i / float(self.num_bands)) * 2.0
+            # ★高周波帯域ほど強くするが、過度にならないように調整
+            freq_boost = 1.0 + (i / float(self.num_bands)) * 1.2  # 2.0 → 1.2
 
             band_noise = filtered * band_env * intensity * freq_boost
             total_noise = total_noise + band_noise
 
         # 正規化と全体ゲイン適用
         total_noise = total_noise / float(self.num_bands)
-        total_noise = total_noise * global_noise_gain * 1.5  # ★音色別に調整可能
+        # ★全体的なノイズレベルを削減（1.5 → 0.8）
+        total_noise = total_noise * global_noise_gain * 0.8
 
         return total_noise
+
+
+# ========================================
+# ★新規: 奇数倍音強調レイヤー
+# ========================================
+class OddHarmonicEnhancer(tf.keras.layers.Layer):
+    """
+    奇数倍音を強調し、偶数倍音を抑制
+    音色によって強調度を調整
+    """
+
+    def __init__(self, num_harmonics=NUM_HARMONICS):
+        super().__init__()
+        self.num_harmonics = num_harmonics
+
+        # 音色ごとの奇数倍音強調度を学習
+        self.odd_enhancement_net = tf.keras.Sequential(
+            [
+                tf.keras.layers.Dense(64, activation="relu"),
+                tf.keras.layers.Dense(32, activation="relu"),
+                tf.keras.layers.Dense(
+                    1, activation="sigmoid"
+                ),  # 奇数倍音強調度 [0, 1]
+            ],
+            name="odd_enhancement",
+        )
+
+    def call(self, amplitudes, timbre):
+        """
+        Args:
+            amplitudes: [batch, time_length, num_harmonics]
+            timbre: [batch, 3]
+
+        Returns:
+            enhanced_amplitudes: [batch, time_length, num_harmonics]
+        """
+        # 音色から奇数倍音強調度を取得
+        odd_strength = self.odd_enhancement_net(timbre)  # [batch, 1]
+
+        # 倍音インデックス (1, 2, 3, ...)
+        harmonic_indices = tf.range(1, self.num_harmonics + 1, dtype=tf.float32)
+
+        # 奇数倍音マスク (1, 3, 5, ...) → 1.0、偶数倍音 (2, 4, 6, ...) → 0.0
+        is_odd = tf.cast(tf.math.mod(harmonic_indices, 2.0) > 0.5, tf.float32)
+
+        # 奇数倍音の強調プロファイル
+        # odd_strength=0の場合: すべて1.0（変化なし）
+        # odd_strength=1の場合: 奇数=2.0、偶数=0.5
+        odd_profile = is_odd * (1.0 + odd_strength[:, :, None]) + (
+            1.0 - is_odd
+        ) * (1.0 - 0.5 * odd_strength[:, :, None])
+
+        odd_profile = tf.reshape(odd_profile, [-1, 1, self.num_harmonics])
+
+        # 適用
+        enhanced_amps = amplitudes * odd_profile
+
+        return enhanced_amps
 
 
 # ========================================
@@ -269,11 +329,11 @@ class FrequencyBandHarmonicController(tf.keras.layers.Layer):
         )
         high_mask = tf.cast(harmonic_indices > 20, tf.float32)
 
-        # 各帯域のゲインを適用
+        # ★各帯域のゲインを適用（高域の過度な強調を抑制 2.0 → 1.5）
         gain_profile = (
             low_mask * low_gain[:, :, None]
             + mid_mask * mid_gain[:, :, None]
-            + high_mask * high_gain[:, :, None] * 2.0  # 高域を2倍強調
+            + high_mask * high_gain[:, :, None] * 1.5
         )
 
         gain_profile = tf.reshape(gain_profile, [-1, 1, self.num_harmonics])
@@ -285,7 +345,7 @@ class FrequencyBandHarmonicController(tf.keras.layers.Layer):
 
 
 # ========================================
-# 改良版HarmonicAmplitudeNet
+# ★改良版HarmonicAmplitudeNet（奇数倍音強調を追加）
 # ========================================
 class HarmonicAmplitudeNet(tf.keras.layers.Layer):
     def __init__(self, num_harmonics=NUM_HARMONICS, output_length=TIME_LENGTH):
@@ -325,6 +385,9 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
         # 周波数帯域別制御
         self.band_controller = FrequencyBandHarmonicController(num_harmonics)
 
+        # ★奇数倍音強調
+        self.odd_enhancer = OddHarmonicEnhancer(num_harmonics)
+
     def call(self, z, cond):
         batch_size = tf.shape(z)[0]
         latent_steps = tf.shape(z)[1]
@@ -350,6 +413,9 @@ class HarmonicAmplitudeNet(tf.keras.layers.Layer):
         # 周波数帯域別制御
         timbre = cond[:, 1:]
         amps = self.band_controller(amps, timbre, z_features)
+
+        # ★奇数倍音強調
+        amps = self.odd_enhancer(amps, timbre)
 
         return amps
 
@@ -496,9 +562,7 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
                 tf.keras.layers.Dense(128, activation="relu"),
                 tf.keras.layers.Dense(64, activation="relu"),
                 tf.keras.layers.Dense(32, activation="relu"),
-                tf.keras.layers.Dense(
-                    4, activation="sigmoid"
-                ),  # ★4パラメータに増加
+                tf.keras.layers.Dense(4, activation="sigmoid"),  # 4パラメータ
             ],
             name="adsr_param_net",
         )
@@ -521,9 +585,7 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         attack_speed = adsr_params[:, 0:1] * 25.0 + 1.0
         decay_rate = adsr_params[:, 1:2] * 20.0 + 0.5
         sustain_level = adsr_params[:, 2:3] * 0.9 + 0.05
-        sustain_duration = (
-            adsr_params[:, 3:4] * 0.5 + 0.2
-        )  # ★新規: サステイン長さ
+        sustain_duration = adsr_params[:, 3:4] * 0.5 + 0.2
 
         lfo_params = self.lfo_param_net(combined_input)
         lfo_rate = lfo_params[:, 0:1] * 8.0 + 1.0
@@ -548,12 +610,10 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
             1.0 - tf.exp(-decay_rate * decay_t)
         )
 
-        # ★サステイン期間を可変に
         sustain_end = decay_end + sustain_duration[:, 0:1]
         sustain_mask = tf.cast((t >= decay_end) & (t < sustain_end), tf.float32)
         sustain_curve = sustain_level
 
-        # リリース
         release_mask = tf.cast(t >= sustain_end, tf.float32)
         release_t = (t - sustain_end) / (1.0 - sustain_end + 1e-6)
         release_curve = sustain_level * tf.exp(-decay_rate * release_t)
@@ -561,7 +621,7 @@ class TimbreEnvelopeShaper(tf.keras.layers.Layer):
         envelope_shape = (
             attack_mask * attack_curve
             + decay_mask * decay_curve
-            + sustain_mask * sustain_curve  # ★サステイン追加
+            + sustain_mask * sustain_curve
             + release_mask * release_curve
         )
 
@@ -715,13 +775,13 @@ def sample_z(z_mean, z_logvar):
 
 
 # ========================================
-# 改良版Decoder: ノイズとエンベロープを音色別に最適化
+# ★改良版Decoder: ノイズを控えめに、倍音構造を保護
 # ========================================
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim))
     cond = tf.keras.Input(shape=(cond_dim,))
 
-    # 倍音振幅生成（周波数帯域別制御）
+    # 倍音振幅生成（周波数帯域別制御 + 奇数倍音強調）
     harmonic_amp_net = HarmonicAmplitudeNet(num_harmonics=NUM_HARMONICS)
     base_harmonic_amps = harmonic_amp_net(z_in, cond)
 
@@ -734,11 +794,11 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     envelope_net = EnvelopeNet()
     base_envelope, z_envelope_features = envelope_net(z_in, cond)
 
-    # 音色によるエンベロープシェイピング（改良版）
+    # 音色によるエンベロープシェイピング
     envelope_shaper = TimbreEnvelopeShaper()
     envelope = envelope_shaper(base_envelope, timbre, z_envelope_features)
 
-    # ★適応的ノイズ生成（音色別に自動調整）
+    # ★適応的ノイズ生成（倍音構造を保護する控えめな設定）
     adaptive_noise_gen = AdaptiveNoiseGenerator(num_bands=4)
     noise = adaptive_noise_gen(z_in, cond)
 
@@ -766,8 +826,12 @@ def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
         base_harmonic_wave, z_in, cond, fundamental_freq
     )
 
-    # ★最終合成（ノイズは音色別に調整されるので固定倍率は削除）
-    output = thick_harmonic_wave * envelope + noise
+    # ★最終合成: 倍音を優先し、ノイズは控えめに混ぜる
+    # 倍音:ノイズ = 約 10:1 の比率
+    harmonic_component = thick_harmonic_wave * envelope
+    noise_component = noise * 0.1  # ノイズを10%に抑制
+
+    output = harmonic_component + noise_component
     output = tf.keras.layers.Activation("tanh")(output)
     output = tf.keras.layers.Lambda(lambda x: x[:, :, None])(output)
 
@@ -837,7 +901,7 @@ class TimeWiseCVAE(tf.keras.Model):
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
             )
 
-            # 高周波強調損失
+            # 高周波強調損失（screechの高周波特性のため）
             high_freq_loss = compute_high_freq_emphasis_loss(x_target, x_hat_sq)
 
             # スペクトルフラックス損失
@@ -853,12 +917,12 @@ class TimeWiseCVAE(tf.keras.Model):
 
             kl_weight = self.compute_kl_weight()
 
-            # 総合損失
+            # ★総合損失: 高周波損失を削減、メル損失を増加（倍音構造保護のため）
             loss = (
                 recon * 25.0
                 + stft_loss * 12.0
-                + mel_loss * 10.0
-                + high_freq_loss * 15.0
+                + mel_loss * 15.0  # 10.0 → 15.0
+                + high_freq_loss * 8.0  # 15.0 → 8.0
                 + spectral_flux_loss * 8.0
                 + kl_divergence * kl_weight
             )
