@@ -857,7 +857,7 @@ def main():
             print(f"    ✓ 重みを読み込みました: {ckpt}")
 
             print("[2] リファレンス音声読み込み中...")
-            reference = load_wav("datasets/0013.wav")
+            reference = load_wav("datasets/0021.wav")
             reference = crop_or_pad(reference, TIME_LENGTH)
             print("    ✓ リファレンス読み込み完了")
 
