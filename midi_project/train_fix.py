@@ -1,391 +1,434 @@
-import tensorflow as tf
-import numpy as np
+"""
+train.py  ―  TimeWiseCVAE 訓練スクリプト
+
+使い方:
+    python train.py                          # デフォルト設定で学習
+    python train.py --epochs 300            # エポック数を指定
+    python train.py --resume                # チェックポイントから再開
+    python train.py --csv path/to/data.csv  # CSVを指定
+
+出力ディレクトリ構造:
+    checkpoints/
+        best_weights.weights.h5     ← val_loss が改善するたびに保存
+        latest.weights.h5           ← エポックごとに上書き保存
+    logs/
+        fit/                        ← TensorBoard ログ
+    weights_final.weights.h5        ← 学習完了後の最終重みファイル
+"""
+
+import argparse
+import csv
 import os
-from model import TimeWiseCVAE, TIME_LENGTH
-from create_datasets import make_dataset_from_synth_csv
+import random
+import time
+from pathlib import Path
 
-# GPUメモリ設定
-gpus = tf.config.experimental.list_physical_devices("GPU")
-if gpus:
-    try:
-        for gpu in gpus:
-            tf.config.experimental.set_memory_growth(gpu, True)
-    except RuntimeError as e:
-        print(e)
+import numpy as np
+import soundfile as sf
+import tensorflow as tf
 
+from model import (
+    TIME_LENGTH,
+    TIMBRE_VOCAB,
+    TimeWiseCVAE,
+)
 
-def create_callbacks(save_dir="weights"):
-    """訓練用コールバック"""
-    os.makedirs(save_dir, exist_ok=True)
+# ============================================================
+# ハイパーパラメータ (argparse でも上書き可能)
+# ============================================================
+DEFAULTS = dict(
+    csv="dataset.csv",  # データセットCSVのパス
+    wav_root=".",  # WAVファイルのルートディレクトリ
+    epochs=300,
+    batch_size=16,
+    lr=2e-4,
+    val_split=0.1,  # 検証データの割合
+    seed=42,
+    out_dir=".",  # 重みファイルの出力先
+    ckpt_dir="checkpoints",
+    log_dir="logs/fit",
+    resume=False,  # チェックポイントから再開するか
+)
 
-    callbacks = [
-        # チェックポイント保存（10エポックごと）
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=os.path.join(save_dir, "epoch_{epoch:03d}.weights.h5"),
-            save_weights_only=True,
-            save_freq="epoch",
-            period=10,
-            verbose=1,
-        ),
-        # 最良モデル保存
-        tf.keras.callbacks.ModelCheckpoint(
-            filepath=os.path.join(save_dir, "best_model.weights.h5"),
-            save_weights_only=True,
-            save_best_only=True,
-            monitor="loss",
-            mode="min",
-            verbose=1,
-        ),
-        # TensorBoard
-        tf.keras.callbacks.TensorBoard(
-            log_dir="logs",
-            histogram_freq=0,
-            write_graph=False,
-            update_freq="epoch",
-        ),
-        # 学習率スケジューリング
-        tf.keras.callbacks.ReduceLROnPlateau(
-            monitor="loss",
-            factor=0.5,
-            patience=20,
-            min_lr=1e-6,
-            verbose=1,
-        ),
-        # Early Stopping（オプション）
-        tf.keras.callbacks.EarlyStopping(
-            monitor="loss",
-            patience=50,
-            restore_best_weights=True,
-            verbose=1,
-        ),
-        # カスタムコールバック：学習状況の詳細表示
-        DetailedLogger(),
-        # ★新規: KL損失の監視コールバック
-        KLMonitor(),
-    ]
+# 音色ラベル → ID のマッピング
+TIMBRE_MAP = {"screech": 0, "acid": 1, "pluck": 2}
 
-    return callbacks
+SR = 48000
 
 
-class DetailedLogger(tf.keras.callbacks.Callback):
-    """詳細なログ出力"""
-
-    def on_epoch_end(self, epoch, logs=None):
-        if logs is None:
-            logs = {}
-
-        print(f"\n{'='*60}")
-        print(f"Epoch {epoch+1} 完了")
-        print(f"{'='*60}")
-        print(f"Loss: {logs.get('loss', 0):.6f}")
-        print(f"  - Recon: {logs.get('recon', 0):.6f}")
-        print(f"  - STFT: {logs.get('stft', 0):.6f}")
-        print(f"  - Mel: {logs.get('mel', 0):.6f}")
-        print(
-            f"  - KL: {logs.get('kl', 0):.6f} (weight: {logs.get('kl_weight', 0):.6f})"
-        )
-        print(f"Z stats:")
-        print(f"  - std_ema: {logs.get('z_std_ema', 0):.6f}")
-        print(f"  - grad_norm: {logs.get('grad_norm', 0):.6f}")
-        print(f"{'='*60}\n")
-
-
-class KLMonitor(tf.keras.callbacks.Callback):
+# ============================================================
+# データローダー
+# ============================================================
+def load_wav(path: str, target_length: int = TIME_LENGTH) -> np.ndarray:
     """
-    ★新規: KL損失の監視と警告
-    z=random問題を検出するためのコールバック
+    WAVファイルを読み込み、モノラル・float32・固定長に整形して返す。
+
+    - ステレオ → モノラル変換 (チャンネル平均)
+    - 長さが足りない場合はゼロパディング
+    - 長さが超過する場合は先頭からトリミング
+    - ピーク正規化 (最大絶対値が 1.0 を超えないように)
     """
+    audio, sr = sf.read(path, dtype="float32", always_2d=True)
+    audio = audio.mean(axis=1)  # モノラル化
 
-    def __init__(self):
-        super().__init__()
-        self.kl_history = []
-        self.z_std_history = []
+    if sr != SR:
+        # 簡易リサンプリング (scipy がない環境向けに線形補間で近似)
+        orig_len = len(audio)
+        target_sr_len = int(orig_len * SR / sr)
+        audio = np.interp(
+            np.linspace(0, orig_len - 1, target_sr_len),
+            np.arange(orig_len),
+            audio,
+        ).astype(np.float32)
 
-    def on_epoch_end(self, epoch, logs=None):
-        if logs is None:
-            logs = {}
+    # 長さ調整
+    if len(audio) < target_length:
+        audio = np.pad(audio, (0, target_length - len(audio)))
+    else:
+        audio = audio[:target_length]
 
-        kl_loss = logs.get("kl", 0)
-        z_std = logs.get("z_std_ema", 0)
-        kl_weight = logs.get("kl_weight", 0)
+    # ピーク正規化
+    peak = np.max(np.abs(audio))
+    if peak > 1e-6:
+        audio = audio / peak
 
-        self.kl_history.append(kl_loss)
-        self.z_std_history.append(z_std)
+    return audio.astype(np.float32)  # [TIME_LENGTH]
 
-        # 警告チェック
-        warnings = []
 
-        # KL損失が低すぎる（posterior collapse）
-        if epoch > 40 and kl_loss < 0.1:
-            warnings.append(
-                "⚠️  KL損失が低すぎます。Posterior collapseの可能性があります。"
+def parse_csv(csv_path: str, wav_root: str):
+    """
+    CSVを読み込み、サンプルのリストを返す。
+
+    各サンプル:
+        {
+            "path"     : str   (WAVファイルの絶対パス),
+            "pitch"    : float (正規化ピッチ: (MIDI - 36) / 35),
+            "timbre_id": int   (0=Screech, 1=Acid, 2=Pluck),
+        }
+    """
+    samples = []
+    with open(csv_path, newline="", encoding="utf-8") as f:
+        reader = csv.DictReader(f)
+        for row in reader:
+            wav_path = os.path.join(wav_root, row["path"].replace("\\", "/"))
+
+            # 音高を正規化  (MIDI 36〜71 → 0.0〜1.0)
+            midi = int(row["pitch"])
+            pitch = (midi - 36) / 35.0
+
+            # one-hot → 整数ID
+            one_hot = [int(row["screech"]), int(row["acid"]), int(row["pluck"])]
+            timbre_id = int(np.argmax(one_hot))
+
+            samples.append(
+                {
+                    "path": wav_path,
+                    "pitch": np.float32(pitch),
+                    "timbre_id": np.int32(timbre_id),
+                }
             )
 
-        # zの標準偏差が小さすぎる
-        if epoch > 40 and z_std < 0.3:
-            warnings.append(
-                "⚠️  Zの標準偏差が小さすぎます。潜在空間が使われていない可能性があります。"
+    return samples
+
+
+class AudioDataset:
+    """
+    WAVファイルリストを tf.data.Dataset に変換するクラス。
+
+    __init__ 時に全WAVをメモリにキャッシュするオプションあり
+    (データセット全体が ~1.2GB 以内ならキャッシュ推奨)。
+    """
+
+    def __init__(
+        self,
+        samples: list,
+        batch_size: int,
+        shuffle: bool = True,
+        cache: bool = True,
+    ):
+        self.samples = samples
+        self.batch_size = batch_size
+        self.shuffle = shuffle
+        self.n = len(samples)
+
+        # WAVをメモリにプリロード
+        print(f"  WAVをメモリにロード中 ({self.n} ファイル)...")
+        t0 = time.time()
+        if cache:
+            self._audio = np.zeros((self.n, TIME_LENGTH), dtype=np.float32)
+            self._pitch = np.zeros(self.n, dtype=np.float32)
+            self._timbre_id = np.zeros(self.n, dtype=np.int32)
+            for i, s in enumerate(samples):
+                self._audio[i] = load_wav(s["path"])
+                self._pitch[i] = s["pitch"]
+                self._timbre_id[i] = s["timbre_id"]
+                if (i + 1) % 100 == 0:
+                    print(f"    {i+1}/{self.n}")
+            self._cached = True
+        else:
+            self._cached = False
+        print(f"  ロード完了 ({time.time()-t0:.1f}s)")
+
+    def build(self) -> tf.data.Dataset:
+        if self._cached:
+            # メモリからTensorSlicesデータセットを作成
+            audio_t = tf.constant(
+                self._audio[:, :, None]
+            )  # [N, TIME_LENGTH, 1]
+            pitch_t = tf.constant(self._pitch)  # [N]
+            tid_t = tf.constant(self._timbre_id)  # [N]
+            ds = tf.data.Dataset.from_tensor_slices((audio_t, pitch_t, tid_t))
+        else:
+            # ファイルパスから都度ロード (メモリ節約モード)
+            paths = [s["path"] for s in self.samples]
+            pitches = [s["pitch"] for s in self.samples]
+            tids = [s["timbre_id"] for s in self.samples]
+            ds = tf.data.Dataset.from_tensor_slices((paths, pitches, tids))
+            ds = ds.map(
+                lambda p, pitch, tid: (
+                    tf.py_function(
+                        lambda x: load_wav(x.numpy().decode())[:, None],
+                        [p],
+                        tf.float32,
+                    ),
+                    pitch,
+                    tid,
+                ),
+                num_parallel_calls=tf.data.AUTOTUNE,
             )
 
-        # zの標準偏差が大きすぎる
-        if z_std > 3.0:
-            warnings.append("⚠️  Zの標準偏差が大きすぎます。学習が不安定です。")
+        if self.shuffle:
+            ds = ds.shuffle(buffer_size=self.n, reshuffle_each_iteration=True)
 
-        # KL weightが適切に増加しているか
-        if epoch == 30 and kl_weight < 0.00001:
-            warnings.append("⚠️  KL weightの増加が遅すぎます。")
-
-        # 警告を表示
-        if warnings:
-            print("\n" + "🔍 診断メッセージ ".center(60, "="))
-            for warning in warnings:
-                print(warning)
-            print("=" * 60 + "\n")
-
-        # 良好な状態を報告
-        if (
-            epoch > 60
-            and 0.5 < kl_loss < 5.0
-            and 0.5 < z_std < 2.0
-            and kl_weight > 0.0001
-        ):
-            print("\n✅ 潜在変数の学習が良好です！")
+        ds = ds.batch(self.batch_size, drop_remainder=False)
+        ds = ds.prefetch(tf.data.AUTOTUNE)
+        return ds
 
 
-class SynthesisTest(tf.keras.callbacks.Callback):
+# ============================================================
+# コールバック
+# ============================================================
+class CheckpointCallback(tf.keras.callbacks.Callback):
     """
-    ★新規: 定期的に合成テストを実行
-    z=0とz=randomでの音声合成をテスト
+    エポックごとに最新重みを保存し、
+    val_loss が改善した場合はベスト重みも保存する。
     """
 
-    def __init__(self, test_interval=10, output_dir="test_outputs"):
+    def __init__(self, ckpt_dir: str):
         super().__init__()
-        self.test_interval = test_interval
-        self.output_dir = output_dir
-        os.makedirs(output_dir, exist_ok=True)
+        self.ckpt_dir = Path(ckpt_dir)
+        self.ckpt_dir.mkdir(parents=True, exist_ok=True)
+        self.best_val = float("inf")
+        self.best_path = self.ckpt_dir / "best_weights.weights.h5"
+        self.latest_path = self.ckpt_dir / "latest.weights.h5"
 
     def on_epoch_end(self, epoch, logs=None):
-        if (epoch + 1) % self.test_interval != 0:
-            return
+        logs = logs or {}
 
-        print(f"\n🎵 合成テスト (Epoch {epoch+1}) ".center(60, "="))
+        # 毎エポック: 最新重みを保存
+        self.model.save_weights(str(self.latest_path))
 
-        # テスト用条件: [pitch, screech, acid, pluck]
-        test_conditions = [
-            ([0.5, 0.0, 0.0, 1.0], "pluck"),
-            ([0.3, 0.0, 1.0, 0.0], "acid"),
-            ([0.7, 1.0, 0.0, 0.0], "screech"),
+        # val_loss が改善した場合: ベスト重みを保存
+        val_loss = logs.get("val_loss", float("inf"))
+        if val_loss < self.best_val:
+            self.best_val = val_loss
+            self.model.save_weights(str(self.best_path))
+            print(
+                f"  → ベスト更新 val_loss={val_loss:.4f}  saved: {self.best_path}"
+            )
+
+
+class PrintMetricsCallback(tf.keras.callbacks.Callback):
+    """
+    train_step が返すカスタムメトリクスを整形して表示するコールバック。
+    """
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        items = [
+            f"loss={logs.get('loss', 0):.4f}",
+            f"recon={logs.get('recon', 0):.4f}",
+            f"kl={logs.get('kl', 0):.4f}",
+            f"kl_w={logs.get('kl_weight', 0):.5f}",
+            f"stft={logs.get('stft', 0):.4f}",
+            f"mel={logs.get('mel', 0):.4f}",
+            f"z_std={logs.get('z_std_ema', 0):.3f}",
+            f"g_norm={logs.get('grad_norm', 0):.3f}",
         ]
-
-        for cond_values, timbre_name in test_conditions:
-            cond = tf.constant([cond_values], dtype=tf.float32)
-
-            # z=0でテスト
-            z_zero = tf.zeros((1, self.model.decoder.input[0].shape[1], 64))
-            try:
-                output_zero = self.model.decoder([z_zero, cond], training=False)
-                rms_zero = tf.sqrt(tf.reduce_mean(tf.square(output_zero)))
-                status_zero = "✓" if rms_zero > 0.01 else "✗"
-                print(
-                    f"  {timbre_name} (z=0): RMS={rms_zero:.4f} {status_zero}"
-                )
-            except Exception as e:
-                print(f"  {timbre_name} (z=0): エラー - {str(e)}")
-
-            # z=randomでテスト
-            z_random = tf.random.normal(
-                (1, self.model.decoder.input[0].shape[1], 64)
-            )
-            try:
-                output_random = self.model.decoder(
-                    [z_random, cond], training=False
-                )
-                rms_random = tf.sqrt(tf.reduce_mean(tf.square(output_random)))
-                status_random = "✓" if rms_random > 0.01 else "✗"
-                print(
-                    f"  {timbre_name} (z=random): RMS={rms_random:.4f} {status_random}"
-                )
-            except Exception as e:
-                print(f"  {timbre_name} (z=random): エラー - {str(e)}")
-
-        print("=" * 60 + "\n")
+        val_loss = logs.get("val_loss")
+        if val_loss is not None:
+            items.append(f"val_loss={val_loss:.4f}")
+        print(f"  Epoch {epoch+1:4d}  " + "  ".join(items))
 
 
-def main():
-    print("=" * 60)
-    print("改善版 DDSP風モデル 訓練スクリプト")
-    print("=" * 60)
+# ============================================================
+# メイン: build_and_train
+# ============================================================
+def build_and_train(cfg: dict):
+    # --- 再現性 ---
+    tf.random.set_seed(cfg["seed"])
+    np.random.seed(cfg["seed"])
+    random.seed(cfg["seed"])
 
-    # ハイパーパラメータ
-    BATCH_SIZE = 16
-    EPOCHS = 200
-    LEARNING_RATE = 1e-4
+    # --- GPU メモリ設定 (動的確保) ---
+    for gpu in tf.config.list_physical_devices("GPU"):
+        tf.config.experimental.set_memory_growth(gpu, True)
 
-    print(f"\n設定:")
-    print(f"  Batch size: {BATCH_SIZE}")
-    print(f"  Epochs: {EPOCHS}")
-    print(f"  Learning rate: {LEARNING_RATE}")
+    # -----------------------------------------------------------------
+    # データ準備
+    # -----------------------------------------------------------------
+    print("=== データセットを読み込み中 ===")
+    samples = parse_csv(cfg["csv"], cfg["wav_root"])
+    print(f"  総サンプル数: {len(samples)}")
 
-    # データセット作成
-    print("\n[1] データセット読み込み中...")
-    train_dataset = make_dataset_from_synth_csv(
-        "dataset.csv",
-        batch_size=BATCH_SIZE,
-    )
-    train_dataset = train_dataset.repeat()
+    # 音色ごとのサンプル数を表示
+    for name, tid in TIMBRE_MAP.items():
+        n = sum(1 for s in samples if s["timbre_id"] == tid)
+        print(f"  {name} (id={tid}): {n} サンプル")
 
-    # 1エポックあたりのステップ数を計算
-    steps_per_epoch = 87  # あなたのデータセットサイズに合わせて変更
+    # シャッフルして train / val に分割
+    random.shuffle(samples)
+    n_val = max(1, int(len(samples) * cfg["val_split"]))
+    val_s = samples[:n_val]
+    train_s = samples[n_val:]
+    print(f"  train: {len(train_s)}  val: {len(val_s)}")
 
-    print(f"✓ データセット読み込み完了")
-    print(f"  Steps per epoch: {steps_per_epoch}")
+    print("\n=== 学習データをロード中 ===")
+    train_ds = AudioDataset(train_s, cfg["batch_size"], shuffle=True).build()
+    print("=== 検証データをロード中 ===")
+    val_ds = AudioDataset(val_s, cfg["batch_size"], shuffle=False).build()
 
+    # steps_per_epoch の計算
+    steps_per_epoch = (len(train_s) + cfg["batch_size"] - 1) // cfg[
+        "batch_size"
+    ]
+    print(f"\n  steps_per_epoch: {steps_per_epoch}")
+
+    # -----------------------------------------------------------------
     # モデル構築
-    print("\n[2] モデル構築中...")
+    # -----------------------------------------------------------------
+    print("\n=== モデルを構築中 ===")
     model = TimeWiseCVAE(steps_per_epoch=steps_per_epoch)
 
-    # オプティマイザ
-    optimizer = tf.keras.optimizers.Adam(
-        learning_rate=LEARNING_RATE,
-        clipnorm=1.0,  # 勾配クリッピング
-    )
+    # ダミー入力でビルド (重みを初期化)
+    dummy_audio = tf.zeros([1, TIME_LENGTH, 1])
+    dummy_pitch = tf.zeros([1])
+    dummy_tid = tf.zeros([1], dtype=tf.int32)
+    model((dummy_audio, dummy_pitch, dummy_tid), training=False)
+    print(f"  学習パラメータ数: {model.count_params():,}")
+
+    # -----------------------------------------------------------------
+    # オプティマイザ・コンパイル
+    # -----------------------------------------------------------------
+    optimizer = tf.keras.optimizers.Adam(learning_rate=cfg["lr"])
     model.compile(optimizer=optimizer)
 
-    # ダミーデータでモデルをビルド
-    dummy_x = tf.zeros((1, TIME_LENGTH, 1))
-    dummy_cond = tf.zeros((1, 4))
-    _ = model((dummy_x, dummy_cond), training=False)
+    # -----------------------------------------------------------------
+    # チェックポイントから再開
+    # -----------------------------------------------------------------
+    ckpt_dir = Path(cfg["ckpt_dir"])
+    latest_path = ckpt_dir / "latest.weights.h5"
+    if cfg["resume"] and latest_path.exists():
+        print(f"\n=== チェックポイントから再開: {latest_path} ===")
+        model.load_weights(str(latest_path))
+    elif cfg["resume"]:
+        print("  チェックポイントが見つかりません。最初から学習します。")
 
-    print("✓ モデル構築完了")
-    print("\n[Encoder]")
-    model.encoder.summary()
-    print("\n[Decoder]")
-    model.decoder.summary()
-
-    # パラメータ数を表示
-    total_params = sum([tf.size(v).numpy() for v in model.trainable_variables])
-    print(f"\n総パラメータ数: {total_params:,}")
-
-    # ★改善点の確認
-    print("\n" + "=" * 60)
-    print("改善ポイント:")
-    print("=" * 60)
-    print("✓ KL warmup: 30エポック（従来: 20）")
-    print("✓ KL rampup: 60エポック（従来: 50）")
-    print("✓ KL target: 0.0003（従来: 0.0005）")
-    print("✓ Free bits: 1.0（従来: 0.8）")
-    print("✓ z_logvar初期値: -2.0（従来: -3.0）")
-    print("✓ 音色特性をcondから直接生成")
-    print("✓ screechノイズ比: 0.3（従来: 0.6）")
-    print("=" * 60)
-
-    # コールバック設定
-    print("\n[3] コールバック設定...")
-    callbacks = create_callbacks()
-    # ★新規: 合成テストコールバックを追加
-    callbacks.append(SynthesisTest(test_interval=10))
-
-    print("✓ コールバック設定完了")
-    print("  - ModelCheckpoint (10エポックごと)")
-    print("  - Best model checkpoint")
-    print("  - TensorBoard")
-    print("  - ReduceLROnPlateau")
-    print("  - EarlyStopping")
-    print("  - DetailedLogger")
-    print("  - KLMonitor (新規)")
-    print("  - SynthesisTest (新規)")
-
-    # 訓練開始
-    print("\n[4] 訓練開始")
-    print("=" * 60)
-    print("学習中の注目ポイント:")
-    print("  1. z_std_ema が 0.5-2.0 の範囲に収束するか")
-    print("  2. KL損失が徐々に増加するか（0.5-5.0が目標）")
-    print("  3. 30エポック以降でKL weightが増加し始めるか")
-    print("  4. 合成テストでz=0とz=randomの両方で音が出るか")
-    print("=" * 60 + "\n")
-
-    try:
-        history = model.fit(
-            train_dataset,
-            epochs=EPOCHS,
-            steps_per_epoch=steps_per_epoch,
-            callbacks=callbacks,
+    # -----------------------------------------------------------------
+    # コールバック
+    # -----------------------------------------------------------------
+    callbacks = [
+        CheckpointCallback(cfg["ckpt_dir"]),
+        PrintMetricsCallback(),
+        tf.keras.callbacks.TensorBoard(
+            log_dir=cfg["log_dir"],
+            histogram_freq=0,
+            update_freq="epoch",
+        ),
+        tf.keras.callbacks.ReduceLROnPlateau(
+            monitor="val_loss",
+            factor=0.5,
+            patience=20,
+            min_lr=1e-5,
             verbose=1,
-        )
+        ),
+    ]
 
-        print("\n" + "=" * 60)
-        print("訓練完了！")
-        print("=" * 60)
+    # -----------------------------------------------------------------
+    # 学習
+    # -----------------------------------------------------------------
+    print(
+        f"\n=== 学習開始  epochs={cfg['epochs']}  batch={cfg['batch_size']} ===\n"
+    )
+    history = model.fit(
+        train_ds,
+        validation_data=val_ds,
+        epochs=cfg["epochs"],
+        callbacks=callbacks,
+        verbose=0,  # PrintMetricsCallback で代替
+    )
 
-        # 最終統計
-        final_loss = history.history["loss"][-1]
-        final_recon = history.history["recon"][-1]
-        final_kl = history.history["kl"][-1]
-        final_z_std = history.history["z_std_ema"][-1]
+    # -----------------------------------------------------------------
+    # 最終重みを保存
+    # -----------------------------------------------------------------
+    out_dir = Path(cfg["out_dir"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    final_path = out_dir / "weights_final.weights.h5"
+    model.save_weights(str(final_path))
+    print(f"\n=== 学習完了 ===")
+    print(f"  最終重み  : {final_path}")
+    print(f"  ベスト重み: {ckpt_dir / 'best_weights.weights.h5'}")
 
-        print(f"\n最終結果:")
-        print(f"  Loss: {final_loss:.6f}")
-        print(f"  Reconstruction: {final_recon:.6f}")
-        print(f"  KL: {final_kl:.6f}")
-        print(f"  Z std EMA: {final_z_std:.6f}")
+    # 埋め込みベクトルを表示 (音色の配置確認)
+    print("\n=== 学習済み音色埋め込みベクトル ===")
+    for name, tid in TIMBRE_MAP.items():
+        emb = model.timbre_embedding.embedding(np.array([tid]))[0].numpy()
+        formatted = ", ".join(f"{v:+.3f}" for v in emb)
+        print(f"  {name:8s} (id={tid}): [{formatted}]")
 
-        # 最良エポックの情報
-        best_epoch = np.argmin(history.history["loss"]) + 1
-        best_loss = np.min(history.history["loss"])
-        print(f"\n最良エポック: {best_epoch}")
-        print(f"  Loss: {best_loss:.6f}")
+    return model, history
 
-        # 学習の健全性チェック
-        print("\n" + "=" * 60)
-        print("学習の健全性チェック:")
-        print("=" * 60)
 
-        checks = []
-        if 0.5 <= final_z_std <= 2.0:
-            checks.append("✓ Z標準偏差が適切な範囲です")
-        else:
-            checks.append(f"✗ Z標準偏差が範囲外です ({final_z_std:.2f})")
-
-        if 0.5 <= final_kl <= 10.0:
-            checks.append("✓ KL損失が適切な範囲です")
-        else:
-            checks.append(f"✗ KL損失が範囲外です ({final_kl:.2f})")
-
-        if final_recon < 0.01:
-            checks.append("✓ 再構成誤差が十分小さいです")
-        else:
-            checks.append(f"⚠️  再構成誤差が大きいです ({final_recon:.4f})")
-
-        for check in checks:
-            print(check)
-
-        print("=" * 60)
-
-    except KeyboardInterrupt:
-        print("\n訓練が中断されました")
-        print("最後のチェックポイントが保存されています")
-
-    print("\n保存場所:")
-    print("  weights/best_model.weights.h5 - 最良モデル")
-    print("  weights/epoch_XXX.weights.h5 - 各エポックのチェックポイント")
-    print("  logs/ - TensorBoardログ")
-    print("  test_outputs/ - 合成テスト出力")
-
-    print("\n次のステップ:")
-    print("  1. TensorBoardで訓練曲線を確認")
-    print("     $ tensorboard --logdir=logs")
-    print("  2. 以下の指標を確認:")
-    print("     - z_std_ema: 0.5-2.0の範囲にあるか")
-    print("     - kl: 0.5-5.0の範囲で推移しているか")
-    print("     - kl_weight: 60エポック以降で0.0003に達しているか")
-    print("  3. inference_improved.py で推論テスト")
-    print("     - z=0でpluckの急速減衰を確認")
-    print("     - z=0でacidのうねりを確認")
-    print("     - z=0でscreechのノイズ量を確認")
-    print("     - z=randomで音が正常に生成されるか確認")
-    print("=" * 60)
+# ============================================================
+# エントリーポイント
+# ============================================================
+def parse_args():
+    p = argparse.ArgumentParser(description="TimeWiseCVAE 訓練スクリプト")
+    p.add_argument(
+        "--csv", default=DEFAULTS["csv"], help="データセットCSVのパス"
+    )
+    p.add_argument(
+        "--wav_root",
+        default=DEFAULTS["wav_root"],
+        help="WAVファイルのルートディレクトリ",
+    )
+    p.add_argument("--epochs", default=DEFAULTS["epochs"], type=int)
+    p.add_argument("--batch_size", default=DEFAULTS["batch_size"], type=int)
+    p.add_argument("--lr", default=DEFAULTS["lr"], type=float)
+    p.add_argument("--val_split", default=DEFAULTS["val_split"], type=float)
+    p.add_argument("--seed", default=DEFAULTS["seed"], type=int)
+    p.add_argument(
+        "--out_dir",
+        default=DEFAULTS["out_dir"],
+        help="最終重みの出力先ディレクトリ",
+    )
+    p.add_argument(
+        "--ckpt_dir",
+        default=DEFAULTS["ckpt_dir"],
+        help="チェックポイントディレクトリ",
+    )
+    p.add_argument(
+        "--log_dir",
+        default=DEFAULTS["log_dir"],
+        help="TensorBoardログディレクトリ",
+    )
+    p.add_argument(
+        "--resume", action="store_true", help="latest.weights.h5 から再開"
+    )
+    return p.parse_args()
 
 
 if __name__ == "__main__":
-    main()
+    args = parse_args()
+    cfg = vars(args)
+    build_and_train(cfg)
