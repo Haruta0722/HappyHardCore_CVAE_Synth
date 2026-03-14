@@ -1,58 +1,47 @@
 """
-DDSP-style Conditional VAE  (Timbre Embedding版)
+cvae.py  ―  Conditional VAE モデル
 
-条件ベクトルの構成:
-  pitch     : スカラー (正規化済み MIDI ノート番号)
-  timbre_id : 整数 (0=Screech, 1=Acid, 2=Pluck)
-              → TimbreEmbedding で TIMBRE_EMBED_DIM 次元の連続ベクトルに変換
-  cond      : [pitch(1), timbre_embed(TIMBRE_EMBED_DIM)] → COND_DIM 次元
+【役割】
+  ユーザー操作 (pitch, 音色ブレンド) を受け取り、
+  DDSPパラメータを推論して dsp.py に渡す。
 
-アーキテクチャの流れ:
-  (pitch, timbre_id)
-      → TimbreEmbedding → cond [batch, COND_DIM]
-                ↓
-  Audio → Encoder(audio, cond) → z_mean, z_logvar
-                                        ↓ reparameterization
-          (z, cond) → DDSPParameterDecoder
-                           ├─ amplitudes            [batch, LATENT_STEPS, 1]
-                           ├─ harmonic_distribution [batch, LATENT_STEPS, NUM_HARMONICS]
-                           └─ noise_magnitudes      [batch, LATENT_STEPS, NOISE_FIR_LEN]
-                                        ↓ DSPモジュール (学習パラメータなし)
-                           HarmonicSynthesizer + FilteredNoiseSynthesizer
-                                        ↓
-                                    x_hat (音声波形)
+【ハード化時の使い方】
+  VAE専用マイコンはこのファイルと config.py を参照する。
+  DSP専用マイコンは dsp.py と config.py だけ参照すればよく、
+  TensorFlow は不要。
+
+【モジュール構成】
+  TimbreEmbedding          音色ID → 連続埋め込みベクトル
+  build_encoder()          Encoder q(z | x, cond)
+  sample_z()               Reparameterization trick
+  DDSPParameterDecoder     Decoder (z, cond) → DDSPパラメータ
+  build_decoder()
+  TimeWiseCVAE             VAE本体 (学習・推論・生成)
+  ddsp_params_to_dict()    推論結果をマイコン送信用辞書に変換するヘルパー
 """
 
+import numpy as np
 import tensorflow as tf
 from loss import Loss
-import numpy as np
 
-# ============================================================
-# グローバル定数
-# ============================================================
-SR = 48000
-WAV_LENGTH = 1.3
-TIME_LENGTH = int(WAV_LENGTH * SR)  # 62400 サンプル
-NUM_HARMONICS = 32
-NOISE_FIR_LEN = 65  # FIRフィルタ長 (奇数推奨)
-LATENT_DIM = 64
-
-# 音色埋め込み
-TIMBRE_VOCAB = 3  # Screech=0, Acid=1, Pluck=2
-TIMBRE_EMBED_DIM = 8  # 埋め込み次元 (データ量1296に対して適切なサイズ)
-
-# Encoder / Decoder が受け取る条件ベクトルの次元
-# = pitch(1) + timbre_embed(TIMBRE_EMBED_DIM)
-COND_DIM = 1 + TIMBRE_EMBED_DIM  # = 9
-
-# Encoder ダウンサンプル倍率: 4×4×2×2 = 64
-encoder_channels = [
-    (64, 5, 4),
-    (128, 5, 4),
-    (256, 5, 2),
-    (512, 3, 2),
-]
-LATENT_STEPS = TIME_LENGTH // 64  # 975
+from config import (
+    SR,
+    TIME_LENGTH,
+    LATENT_DIM,
+    LATENT_STEPS,
+    NUM_HARMONICS,
+    NOISE_FIR_LEN,
+    TIMBRE_VOCAB,
+    TIMBRE_EMBED_DIM,
+    TIMBRE_NAMES,
+    COND_DIM,
+    ENCODER_CHANNELS,
+)
+from dsp import (
+    HarmonicSynthesizer,
+    FilteredNoiseSynthesizer,
+    upsample_frames,
+)
 
 
 # ============================================================
@@ -92,39 +81,21 @@ def compute_high_freq_emphasis_loss(y_true, y_pred, sr=SR, cutoff_freq=2000.0):
 
 
 # ============================================================
-# ユーティリティ: フレーム → サンプルのアップサンプル
-# ============================================================
-def upsample_frames(x, target_length):
-    """[batch, frames, ch] → [batch, target_length, ch] (bilinear補間)"""
-    x = tf.expand_dims(x, axis=2)
-    x = tf.image.resize(x, [target_length, 1], method="bilinear")
-    x = tf.squeeze(x, axis=2)
-    return x
-
-
-# ============================================================
-# TimbreEmbedding
-# 音色IDを連続埋め込みベクトルに変換し、pitchと結合して cond を作る
+# TimbreEmbedding  音色ID → 連続埋め込みベクトル
 # ============================================================
 class TimbreEmbedding(tf.keras.layers.Layer):
     """
-    音色カテゴリ ID → 連続埋め込みベクトル
+    音色カテゴリ ID (整数) を連続埋め込みベクトルに変換し、
+    pitch と結合して条件ベクトル cond を作る。
 
-    学習が進むにつれて、音響的に似た音色は潜在空間で近い位置に、
-    異なる音色は遠い位置に自動的に配置される。
+    学習が進むにつれて音響的に近い音色は潜在空間でも近い位置に配置される。
 
-    将来的なmany-hot (音色混合) への拡張:
-        emb_s = self.embedding(0)  # Screech
-        emb_a = self.embedding(1)  # Acid
-        mixed = 0.5 * emb_s + 0.5 * emb_a  # 50%ブレンド
-        cond  = tf.concat([pitch[:, None], mixed], axis=-1)
+    many-hot (音色ブレンド) への拡張:
+        blend(pitch, timbre_weights) を使い、
+        各カテゴリの埋め込みを重み付き平均することで任意の音色混合を表現する。
     """
 
-    def __init__(
-        self,
-        vocab_size=TIMBRE_VOCAB,
-        embed_dim=TIMBRE_EMBED_DIM,
-    ):
+    def __init__(self, vocab_size=TIMBRE_VOCAB, embed_dim=TIMBRE_EMBED_DIM):
         super().__init__(name="timbre_embedding")
         self.embed_dim = embed_dim
         self.embedding = tf.keras.layers.Embedding(
@@ -136,31 +107,29 @@ class TimbreEmbedding(tf.keras.layers.Layer):
     def call(self, pitch, timbre_id):
         """
         Args:
-            pitch     : 正規化ピッチ [batch]  (float32)
-            timbre_id : 音色カテゴリID [batch] (int32)
+            pitch     : 正規化ピッチ [batch]  float32
+            timbre_id : 音色ID       [batch]  int32
         Returns:
-            cond : [batch, COND_DIM]  (= 1 + embed_dim)
+            cond: [batch, COND_DIM]
         """
         emb = self.embedding(timbre_id)  # [batch, embed_dim]
-        cond = tf.concat([pitch[:, None], emb], axis=-1)  # [batch, 1+embed_dim]
-        return cond
+        return tf.concat([pitch[:, None], emb], axis=-1)  # [batch, COND_DIM]
 
     def blend(self, pitch, timbre_weights):
         """
         many-hot 用: 重み付き混合埋め込みを生成する。
 
         Args:
-            pitch          : [batch]               (float32)
-            timbre_weights : [batch, TIMBRE_VOCAB] (float32, 合計1.0に正規化推奨)
+            pitch          : [batch]               float32
+            timbre_weights : [batch, TIMBRE_VOCAB] float32 (合計1.0推奨)
         Returns:
-            cond : [batch, COND_DIM]
+            cond: [batch, COND_DIM]
         """
-        # embedding テーブル全体 [vocab, embed_dim]
-        all_emb = self.embedding(tf.range(self.embedding.input_dim))
-        # 重み付き平均  [batch, embed_dim]
-        mixed = tf.matmul(timbre_weights, all_emb)
-        cond = tf.concat([pitch[:, None], mixed], axis=-1)
-        return cond
+        all_emb = self.embedding(
+            tf.range(self.embedding.input_dim)
+        )  # [vocab, embed_dim]
+        mixed = tf.matmul(timbre_weights, all_emb)  # [batch, embed_dim]
+        return tf.concat([pitch[:, None], mixed], axis=-1)  # [batch, COND_DIM]
 
 
 # ============================================================
@@ -171,22 +140,20 @@ def build_encoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM):
     音声波形と条件ベクトルを受け取り z_mean, z_logvar を出力。
 
     cond の注入方法:
-      Conv1D で抽出した特徴量 [batch, LATENT_STEPS, 512] に対して
-      cond を RepeatVector でフレーム方向にブロードキャストして concat し、
+      Conv1D 特徴量 [batch, LATENT_STEPS, 512] に cond を
+      RepeatVector でフレーム方向にブロードキャストして concat し、
       追加の Conv1D で融合する。
     """
     x_in = tf.keras.Input(shape=(TIME_LENGTH, 1), name="enc_audio")
     cond = tf.keras.Input(shape=(cond_dim,), name="enc_cond")
 
-    # --- 音声特徴抽出 ---
     x = x_in
-    for ch, k, s in encoder_channels:
+    for ch, k, s in ENCODER_CHANNELS:
         x = tf.keras.layers.Conv1D(ch, k, strides=s, padding="same")(x)
         x = tf.keras.layers.LeakyReLU(0.2)(x)
         x = tf.keras.layers.Dropout(0.1)(x)
     # x: [batch, LATENT_STEPS, 512]
 
-    # --- cond をフレーム方向にブロードキャストして concat ---
     cond_bc = tf.keras.layers.RepeatVector(LATENT_STEPS)(
         cond
     )  # [batch, LATENT_STEPS, cond_dim]
@@ -197,7 +164,6 @@ def build_encoder(latent_dim=LATENT_DIM, cond_dim=COND_DIM):
         x_cond
     )
 
-    # --- 平均・分散 ---
     z_mean = tf.keras.layers.Conv1D(
         latent_dim, 3, padding="same", name="z_mean"
     )(x_cond)
@@ -221,19 +187,18 @@ def sample_z(z_mean, z_logvar):
 
 
 # ============================================================
-# Decoder  (z, cond) → DDSPパラメータ
+# DDSPParameterDecoder  (z, cond) → DDSPパラメータ
 # ============================================================
 class DDSPParameterDecoder(tf.keras.layers.Layer):
     """
-    論文準拠の Decoder。
-    音声波形は生成せず、DSPモジュールへ渡すパラメータのみを出力する。
+    論文準拠のDecoder。音声波形は生成せず DDSPパラメータのみを出力する。
 
-    出力:
+    出力パラメータ:
       amplitudes            [batch, LATENT_STEPS, 1]
       harmonic_distribution [batch, LATENT_STEPS, NUM_HARMONICS]  (softmax済み)
       noise_magnitudes      [batch, LATENT_STEPS, NOISE_FIR_LEN]  (sigmoid済み)
 
-    ネットワーク: input_mlp → GRU → output_mlp → 各ヘッド
+    ネットワーク構成: input_mlp → GRU → output_mlp → 各ヘッド (論文準拠)
     """
 
     def __init__(
@@ -261,7 +226,6 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
             name="output_mlp",
         )
 
-        # 各パラメータへのヘッド
         self.amp_head = tf.keras.layers.Dense(1, name="amp_head")
         self.harm_head = tf.keras.layers.Dense(num_harmonics, name="harm_head")
         self.noise_head = tf.keras.layers.Dense(
@@ -277,7 +241,6 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         latent_steps = tf.shape(z)[1]
         cond_bc = tf.tile(cond[:, None, :], [1, latent_steps, 1])
         x = tf.concat([z, cond_bc], axis=-1)
-
         x = self.input_mlp(x)
         x = self.gru(x)
         x = self.output_mlp(x)
@@ -285,146 +248,54 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         amplitudes = self._modified_sigmoid(self.amp_head(x))
         harmonic_distribution = tf.nn.softmax(self.harm_head(x), axis=-1)
         noise_magnitudes = tf.sigmoid(self.noise_head(x))
-
         return amplitudes, harmonic_distribution, noise_magnitudes
 
 
 def build_decoder(cond_dim=COND_DIM, latent_dim=LATENT_DIM):
     z_in = tf.keras.Input(shape=(LATENT_STEPS, latent_dim), name="dec_z")
     cond = tf.keras.Input(shape=(cond_dim,), name="dec_cond")
-    param_decoder = DDSPParameterDecoder()
-    amps, harm_dist, noise_mag = param_decoder(z_in, cond)
-    return tf.keras.Model(
-        [z_in, cond], [amps, harm_dist, noise_mag], name="decoder"
-    )
+    amps, harm, noise = DDSPParameterDecoder()(z_in, cond)
+    return tf.keras.Model([z_in, cond], [amps, harm, noise], name="decoder")
 
 
 # ============================================================
-# DSPモジュール  (学習パラメータなし・微分可能)
-# ============================================================
-class HarmonicSynthesizer(tf.keras.layers.Layer):
-    """
-    加算合成シンセサイザー (DDSP論文 Section 3.1)
-
-    cumsum による累積位相計算でフレーム境界の位相連続性を保証する。
-    """
-
-    def __init__(self, sr=SR, time_length=TIME_LENGTH):
-        super().__init__(name="harmonic_synth")
-        self.sr = float(sr)
-        self.time_length = time_length
-
-    def call(self, f0_hz, amplitudes, harmonic_distribution):
-        """
-        Args:
-            f0_hz                : [batch]
-            amplitudes           : [batch, frames, 1]
-            harmonic_distribution: [batch, frames, num_harmonics]
-        Returns:
-            audio: [batch, time_length]
-        """
-        num_harmonics = tf.shape(harmonic_distribution)[2]
-        time_frames = tf.shape(amplitudes)[1]
-
-        # 各倍音の絶対振幅
-        harm_amps = (
-            amplitudes * harmonic_distribution
-        )  # [batch, frames, num_harmonics]
-
-        # f0 → 倍音周波数  [batch, frames, num_harmonics]
-        f0_frames = tf.reshape(f0_hz, [-1, 1, 1])
-        f0_frames = tf.tile(f0_frames, [1, time_frames, 1])
-        harm_nums = tf.cast(tf.range(1, num_harmonics + 1), tf.float32)
-        harm_nums = tf.reshape(harm_nums, [1, 1, -1])
-        harm_freqs = f0_frames * harm_nums
-
-        # フレーム → サンプルにアップサンプル
-        harm_amps = upsample_frames(harm_amps, self.time_length)
-        harm_freqs = upsample_frames(harm_freqs, self.time_length)
-
-        harm_amps = tf.clip_by_value(harm_amps, 0.0, 2.0)
-        harm_freqs = tf.clip_by_value(harm_freqs, 0.0, self.sr / 2.0)
-
-        # 累積位相 → sin 波
-        delta_phase = 2.0 * np.pi * harm_freqs / self.sr
-        phase = tf.cumsum(delta_phase, axis=1)
-        harmonics = harm_amps * tf.sin(phase)
-        audio = tf.reduce_sum(harmonics, axis=-1)
-        return tf.clip_by_value(audio, -10.0, 10.0)
-
-
-class FilteredNoiseSynthesizer(tf.keras.layers.Layer):
-    """
-    ノイズシンセサイザー (DDSP論文 Section 3.2)
-
-    ホワイトノイズを noise_magnitudes でフレームごとに振幅整形する。
-    """
-
-    def __init__(self, sr=SR, time_length=TIME_LENGTH):
-        super().__init__(name="noise_synth")
-        self.sr = sr
-        self.time_length = time_length
-
-    def call(self, noise_magnitudes):
-        """
-        Args:
-            noise_magnitudes: [batch, frames, noise_fir_len]
-        Returns:
-            audio: [batch, time_length]
-        """
-        batch_size = tf.shape(noise_magnitudes)[0]
-        noise = tf.random.normal([batch_size, self.time_length])
-
-        # フレームごとの平均エネルギーをエンベロープとして使用
-        envelope = tf.reduce_mean(
-            noise_magnitudes, axis=-1, keepdims=True
-        )  # [batch, frames, 1]
-        envelope = upsample_frames(envelope, self.time_length)
-        envelope = tf.squeeze(envelope, axis=-1)  # [batch, time_length]
-        envelope = tf.clip_by_value(envelope, 0.0, 1.0)
-
-        return tf.clip_by_value(noise * envelope, -2.0, 2.0)
-
-
-# ============================================================
-# TimeWiseCVAE  (モデル本体)
+# TimeWiseCVAE  VAE本体
 # ============================================================
 class TimeWiseCVAE(tf.keras.Model):
     """
-    DDSP-style Conditional VAE with Timbre Embedding
+    DDSP-style Conditional VAE (Timbre Embedding版)
 
     外部インターフェース:
       train_step(data)
         data = (audio, pitch, timbre_id)
-          audio     : [batch, TIME_LENGTH, 1]  float32
-          pitch     : [batch]                  float32  (正規化済み)
-          timbre_id : [batch]                  int32    (0/1/2)
 
-      generate(pitch, timbre_id, temperature=1.0)
+      generate(pitch, timbre_id, temperature)
         → audio [batch, TIME_LENGTH, 1]
+
+      generate_blend(pitch, timbre_weights, temperature)
+        → audio [batch, TIME_LENGTH, 1]
+
+      infer_ddsp_params(pitch, timbre_id または timbre_weights)
+        → DDSPパラメータ辞書  ← ハード化時にマイコンへ送るペイロード
 
       reconstruct(audio, pitch, timbre_id)
         → audio [batch, TIME_LENGTH, 1]
     """
 
     def __init__(
-        self,
-        cond_dim=COND_DIM,
-        latent_dim=LATENT_DIM,
-        steps_per_epoch=87,
+        self, cond_dim=COND_DIM, latent_dim=LATENT_DIM, steps_per_epoch=87
     ):
         super().__init__()
         self.latent_dim = latent_dim
         self.cond_dim = cond_dim
 
-        # --- サブモジュール ---
         self.timbre_embedding = TimbreEmbedding()
         self.encoder = build_encoder(latent_dim, cond_dim)
         self.decoder = build_decoder(cond_dim, latent_dim)
+        # dsp.py の TFレイヤー版を使用 (学習・PC推論用)
         self.harmonic_synth = HarmonicSynthesizer()
         self.noise_synth = FilteredNoiseSynthesizer()
 
-        # --- KL ウォームアップスケジュール ---
         self.steps_per_epoch = steps_per_epoch
         self.kl_warmup_epochs = 30
         self.kl_rampup_epochs = 100
@@ -433,7 +304,6 @@ class TimeWiseCVAE(tf.keras.Model):
         self.kl_target = 1.0
         self.free_bits = 0.5
 
-        # --- 監視用変数 ---
         self.z_std_ema = tf.Variable(1.0, trainable=False, dtype=tf.float32)
         self.best_recon = tf.Variable(
             float("inf"), trainable=False, dtype=tf.float32
@@ -443,18 +313,17 @@ class TimeWiseCVAE(tf.keras.Model):
     # 内部ヘルパー
     # ----------------------------------------------------------
     def _make_cond(self, pitch, timbre_id):
-        """pitch + timbre_id → cond ベクトル [batch, COND_DIM]"""
         return self.timbre_embedding(pitch, timbre_id)
 
     def _pitch_to_f0(self, pitch):
-        """正規化ピッチ → Hz  (pitch ∈ [0,1], MIDI 36〜71)"""
+        midi = pitch * (SR - 36.0) / SR  # ← 使わない。下記の正しい式を使用
         midi = pitch * 35.0 + 36.0
         return 440.0 * tf.pow(2.0, (midi - 69.0) / 12.0)
 
     def _synthesize(
         self, amplitudes, harmonic_distribution, noise_magnitudes, f0_hz
     ):
-        """DDSPパラメータ → 音声波形"""
+        """DDSPパラメータ → 音声波形 (TFレイヤー版)"""
         audio = self.harmonic_synth(f0_hz, amplitudes, harmonic_distribution)
         audio += self.noise_synth(noise_magnitudes) * 0.1
         return tf.keras.activations.tanh(audio)
@@ -469,7 +338,6 @@ class TimeWiseCVAE(tf.keras.Model):
     # call
     # ----------------------------------------------------------
     def call(self, inputs, training=None):
-        """inputs = (audio, pitch, timbre_id)"""
         audio, pitch, timbre_id = inputs
         cond = self._make_cond(pitch, timbre_id)
         z_mean, z_logvar = self.encoder([audio, cond], training=training)
@@ -479,19 +347,10 @@ class TimeWiseCVAE(tf.keras.Model):
         return x_hat[:, :, None], z_mean, z_logvar
 
     # ----------------------------------------------------------
-    # generate
+    # generate / generate_blend
     # ----------------------------------------------------------
     def generate(self, pitch, timbre_id, temperature=1.0):
-        """
-        事前分布 N(0, I) からサンプリングして音声を生成。
-
-        Args:
-            pitch       : [batch]  float32  正規化ピッチ
-            timbre_id   : [batch]  int32    音色ID
-            temperature : float   サンプリング温度
-        Returns:
-            audio : [batch, TIME_LENGTH, 1]
-        """
+        """N(0,I) サンプリングで音声を生成 (単一音色)"""
         cond = self._make_cond(pitch, timbre_id)
         z = (
             tf.random.normal(
@@ -504,16 +363,7 @@ class TimeWiseCVAE(tf.keras.Model):
         return audio[:, :, None]
 
     def generate_blend(self, pitch, timbre_weights, temperature=1.0):
-        """
-        many-hot 音色ブレンドで音声を生成。
-
-        Args:
-            pitch          : [batch]               float32
-            timbre_weights : [batch, TIMBRE_VOCAB] float32  (合計1.0推奨)
-            temperature    : float
-        Returns:
-            audio : [batch, TIME_LENGTH, 1]
-        """
+        """N(0,I) サンプリングで音声を生成 (音色ブレンド)"""
         cond = self.timbre_embedding.blend(pitch, timbre_weights)
         z = (
             tf.random.normal(
@@ -524,6 +374,69 @@ class TimeWiseCVAE(tf.keras.Model):
         amps, harm, noise = self.decoder([z, cond], training=False)
         audio = self._synthesize(amps, harm, noise, self._pitch_to_f0(pitch))
         return audio[:, :, None]
+
+    # ----------------------------------------------------------
+    # infer_ddsp_params  ← ハード化時のメインAPI
+    # ----------------------------------------------------------
+    def infer_ddsp_params(
+        self,
+        pitch,
+        timbre_id=None,
+        timbre_weights=None,
+        temperature=1.0,
+    ) -> dict:
+        """
+        DDSPパラメータを推論してマイコン送信用の辞書として返す。
+
+        VAE専用マイコンが呼び出し、結果をDSP専用マイコンへ送信する。
+        DSP専用マイコンは受け取った辞書を dsp.synthesize_numpy() に渡す。
+
+        Args:
+            pitch          : [batch] float32  正規化ピッチ
+            timbre_id      : [batch] int32    音色ID (単一音色モード)
+            timbre_weights : [batch, TIMBRE_VOCAB] float32  (ブレンドモード)
+                             timbre_id と timbre_weights はどちらか一方を指定
+            temperature    : float  サンプリング温度
+
+        Returns:
+            {
+              "f0_hz":                  float,         スカラー
+              "amplitudes":             np.ndarray,    [LATENT_STEPS, 1]
+              "harmonic_distribution":  np.ndarray,    [LATENT_STEPS, NUM_HARMONICS]
+              "noise_magnitudes":       np.ndarray,    [LATENT_STEPS, NOISE_FIR_LEN]
+            }
+        """
+        if timbre_weights is not None:
+            cond = self.timbre_embedding.blend(pitch, timbre_weights)
+        elif timbre_id is not None:
+            cond = self._make_cond(pitch, timbre_id)
+        else:
+            raise ValueError(
+                "timbre_id か timbre_weights のどちらかを指定してください"
+            )
+
+        z = (
+            tf.random.normal(
+                [tf.shape(pitch)[0], LATENT_STEPS, self.latent_dim]
+            )
+            * temperature
+        )
+        amps, harm, noise = self.decoder([z, cond], training=False)
+
+        # f0_hz を計算 (バッチ先頭要素のスカラー)
+        midi = float(pitch[0]) * 35.0 + 36.0
+        f0_hz = float(440.0 * (2.0 ** ((midi - 69.0) / 12.0)))
+
+        return {
+            "f0_hz": f0_hz,
+            "amplitudes": amps[0].numpy(),  # [LATENT_STEPS, 1]
+            "harmonic_distribution": harm[
+                0
+            ].numpy(),  # [LATENT_STEPS, NUM_HARMONICS]
+            "noise_magnitudes": noise[
+                0
+            ].numpy(),  # [LATENT_STEPS, NOISE_FIR_LEN]
+        }
 
     # ----------------------------------------------------------
     # encode / reconstruct
@@ -543,7 +456,7 @@ class TimeWiseCVAE(tf.keras.Model):
         return audio_out[:, :, None]
 
     # ----------------------------------------------------------
-    # KL スケジュール
+    # KLスケジュール
     # ----------------------------------------------------------
     def compute_kl_weight(self):
         step = tf.cast(self.optimizer.iterations, tf.float32)
@@ -557,27 +470,17 @@ class TimeWiseCVAE(tf.keras.Model):
     # train_step
     # ----------------------------------------------------------
     def train_step(self, data):
-        """
-        data: (audio, pitch, timbre_id) のタプル
-          audio     : [batch, TIME_LENGTH, 1]  float32
-          pitch     : [batch]                  float32
-          timbre_id : [batch]                  int32
-        """
         audio, pitch, timbre_id = data
 
         with tf.GradientTape() as tape:
-            # 条件ベクトル生成
             cond = self._make_cond(pitch, timbre_id)
 
-            # エンコード
             z_mean, z_logvar = self.encoder([audio, cond], training=True)
             z_logvar = tf.clip_by_value(z_logvar, -8.0, 2.0)
             z = tf.clip_by_value(sample_z(z_mean, z_logvar), -10.0, 10.0)
 
-            # デコード → DDSPパラメータ
             amps, harm, noise = self.decoder([z, cond], training=True)
 
-            # DSP合成
             f0_hz = self._pitch_to_f0(pitch)
             x_hat_audio = self._synthesize(amps, harm, noise, f0_hz)[
                 :, :TIME_LENGTH
@@ -586,8 +489,7 @@ class TimeWiseCVAE(tf.keras.Model):
             x_target = tf.clip_by_value(tf.squeeze(audio, axis=-1), -1.0, 1.0)
             x_hat_sq = tf.clip_by_value(x_hat_audio, -1.0, 1.0)
 
-            # 各損失
-            s = self._safe  # エイリアス
+            s = self._safe
             recon = s(tf.reduce_mean(tf.square(x_target - x_hat_sq)))
             stft_l, mel_l, _ = Loss(
                 x_target, x_hat_sq, fft_size=2048, hop_size=512
@@ -597,11 +499,10 @@ class TimeWiseCVAE(tf.keras.Model):
             hf_l = s(compute_high_freq_emphasis_loss(x_target, x_hat_sq))
             flux_l = s(compute_spectral_flux_loss(x_target, x_hat_sq), 0.1)
 
-            # KL (次元ごとに free_bits を適用して posterior collapse を防止)
             kl_per_dim = -0.5 * (
                 1.0 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
             )
-            kl_mean = tf.reduce_mean(kl_per_dim, axis=[0, 1])  # [latent_dim]
+            kl_mean = tf.reduce_mean(kl_per_dim, axis=[0, 1])
             kl = s(
                 tf.clip_by_value(
                     tf.reduce_mean(tf.maximum(kl_mean, self.free_bits)),
@@ -612,7 +513,6 @@ class TimeWiseCVAE(tf.keras.Model):
             )
 
             kl_w = self.compute_kl_weight()
-
             loss = (
                 recon * 5.0
                 + stft_l * 3.0
@@ -623,7 +523,6 @@ class TimeWiseCVAE(tf.keras.Model):
             )
             loss = s(loss, 1000.0)
 
-        # 勾配更新
         grads = tape.gradient(loss, self.trainable_variables)
         grads = [
             (
@@ -646,7 +545,6 @@ class TimeWiseCVAE(tf.keras.Model):
         grad_norm = tf.where(tf.math.is_inf(grad_norm), 0.0, grad_norm)
         self.optimizer.apply_gradients(zip(grads, self.trainable_variables))
 
-        # 監視メトリクス更新
         z_std = s(tf.reduce_mean(tf.math.reduce_std(z_mean, axis=1)), 1.0)
         self.z_std_ema.assign(0.99 * self.z_std_ema + 0.01 * z_std)
         self.best_recon.assign(tf.minimum(self.best_recon, recon))
@@ -664,3 +562,26 @@ class TimeWiseCVAE(tf.keras.Model):
             "z_std_ema": self.z_std_ema,
             "grad_norm": grad_norm,
         }
+
+
+# ============================================================
+# ヘルパー: DDSPパラメータ辞書をマイコン送信用にシリアライズ
+# ============================================================
+def ddsp_params_to_dict(params: dict) -> dict:
+    """
+    infer_ddsp_params() の出力をマイコン送信用に変換する。
+
+    numpy配列 → Python リスト に変換することで
+    JSON / MessagePack / UART 等での送信が可能になる。
+
+    使用例:
+        params  = model.infer_ddsp_params(pitch, timbre_id=timbre_id)
+        payload = ddsp_params_to_dict(params)
+        uart.send(msgpack.packb(payload))   # DSPマイコンへ送信
+    """
+    return {
+        "f0_hz": float(params["f0_hz"]),
+        "amplitudes": params["amplitudes"].tolist(),
+        "harmonic_distribution": params["harmonic_distribution"].tolist(),
+        "noise_magnitudes": params["noise_magnitudes"].tolist(),
+    }
