@@ -1,5 +1,5 @@
 """
-CVAE Synth GUI — Python / tkinter
+CVAE Synth GUI — Python / tkinter  (Timbre Embedding対応版)
 鍵盤を押すとそのピッチで即座に生成・再生する。
 
 依存:
@@ -30,13 +30,20 @@ except ImportError:
 # ── モデル関連 ────────────────────────────────────────────────────────
 try:
     import tensorflow as tf
-    from model import TimeWiseCVAE, TIME_LENGTH, LATENT_DIM, LATENT_STEPS
-    from create_datasets import load_wav, crop_or_pad
+    from cvae import TimeWiseCVAE
+    from config import (
+        TIME_LENGTH,
+        LATENT_DIM,
+        LATENT_STEPS,
+        TIMBRE_VOCAB,
+        TIMBRE_EMBED_DIM,
+    )
 
     HAS_MODEL = True
 except Exception as e:
     HAS_MODEL = False
-    TIME_LENGTH = 48000
+    TIME_LENGTH = 62400  # 48000 * 1.3
+    TIMBRE_VOCAB = 3
     print(f"[警告] モデル読み込みスキップ: {e}")
 
 # ══════════════════════════════════════════════════════════════════════
@@ -63,7 +70,11 @@ KEY_WHITE = "#e8e8e8"
 KEY_BLACK = "#1a1a1a"
 KEY_ACT = ACCENT
 
+# ノブは音色ブレンド比率 → 各音色の代表色
 KNOB_COLORS = {"screech": ACCENT2, "acid": ACID_COL, "pluck": ACCENT3}
+
+# 音色ID マッピング (model.py と一致)
+TIMBRE_NAMES = ["screech", "acid", "pluck"]  # index = timbre_id
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -78,8 +89,33 @@ def midi_to_freq(m):
 
 
 def pitch_norm(m):
-    """(pitch - 36) / 35"""
+    """MIDI ノート番号 → 正規化ピッチ  (36→0.0, 71→1.0)"""
     return (m - 36) / 35.0
+
+
+def weights_to_timbre_id(weights: dict) -> int:
+    """
+    ノブの重みが全てゼロの場合はデフォルト (screech=0) を返す。
+    重みが設定されている場合は最大値の音色IDを返す (単一モード用)。
+    """
+    vals = [weights[n] for n in TIMBRE_NAMES]
+    if max(vals) < 1e-3:
+        return 0  # デフォルト: Screech
+    return int(np.argmax(vals))
+
+
+def weights_to_tensor(weights: dict):
+    """
+    ノブの重みを [1, TIMBRE_VOCAB] の float32 テンソルに変換。
+    合計が 0 のときは均等分布にフォールバック。
+    """
+    vals = np.array([weights[n] for n in TIMBRE_NAMES], dtype=np.float32)
+    total = vals.sum()
+    if total < 1e-6:
+        vals = np.ones(TIMBRE_VOCAB, dtype=np.float32) / TIMBRE_VOCAB
+    else:
+        vals = vals / total  # L1 正規化 (合計 = 1.0)
+    return tf.constant(vals[None, :], dtype=tf.float32)  # [1, TIMBRE_VOCAB]
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -320,16 +356,15 @@ class PianoKeyboard(tk.Canvas):
         self._active = midi
         self._unhighlight(old)
         self._highlight(midi)
-        self.on_note(midi)  # ← SynthApp._on_note_and_generate を呼ぶ
+        self.on_note(midi)
 
     def _highlight(self, midi):
         if midi not in self._key_items:
             return
-        color = KEY_ACT
         for item in self._key_items[midi]:
             try:
-                self.itemconfig(item, fill=color)
-            except:
+                self.itemconfig(item, fill=KEY_ACT)
+            except Exception:
                 pass
 
     def _unhighlight(self, midi):
@@ -339,7 +374,7 @@ class PianoKeyboard(tk.Canvas):
         for item in self._key_items[midi]:
             try:
                 self.itemconfig(item, fill=color)
-            except:
+            except Exception:
                 pass
 
 
@@ -380,12 +415,13 @@ class WaveformView(tk.Canvas):
 #  メインアプリ
 # ══════════════════════════════════════════════════════════════════════
 class SynthApp:
-    def __init__(self, root, model=None, reference=None):
+    def __init__(self, root, model=None):
         self.root = root
         self.model = model
-        self.reference = reference
 
-        self._params = {"screech": 0.0, "acid": 0.0, "pluck": 0.0}
+        # ノブの値 (0.0〜1.0): 音色ブレンド比率
+        # 合計を 1.0 に正規化して generate_blend() に渡す
+        self._params = {"screech": 1.0, "acid": 0.0, "pluck": 0.0}
         self._midi = MIDI_MIN
         self._generating = False
 
@@ -413,7 +449,7 @@ class SynthApp:
         ).pack(side="left")
         tk.Label(
             hdr,
-            text="CONDITIONAL VARIATIONAL AUTOENCODER",
+            text="CONDITIONAL VARIATIONAL AUTOENCODER  /  TIMBRE EMBEDDING",
             bg="#111",
             fg=DIM,
             font=("Courier", 8),
@@ -441,16 +477,16 @@ class SynthApp:
         # メインエリア
         main = tk.Frame(root, bg=BG)
         main.pack(fill="both", expand=True)
-
         left = tk.Frame(main, bg=PANEL)
         left.pack(side="left", fill="both", expand=True, padx=(0, 1))
         right = tk.Frame(main, bg=PANEL2, width=200)
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
 
+        # _bar_cvs を先に作っておく必要があるため vector_panel を先にビルドする
+        self._build_vector_panel(right)
         self._build_knobs(left)
         self._build_waveform(left)
-        self._build_vector_panel(right)
 
         # 鍵盤エリア
         kb_frame = tk.Frame(root, bg="#111", pady=10)
@@ -488,13 +524,11 @@ class SynthApp:
         kb_scroll = tk.Frame(kb_frame, bg="#111")
         kb_scroll.pack(fill="x", padx=16, pady=(8, 0))
 
-        # ★ on_note に _on_note_and_generate を渡す（押したら即生成）
         self._keyboard = PianoKeyboard(
             kb_scroll, on_note=self._on_note_and_generate
         )
         self._keyboard.pack(side="left")
 
-        # キーボードショートカット
         root.bind("<Left>", lambda e: self._key_shift(-1))
         root.bind("<Right>", lambda e: self._key_shift(+1))
         root.bind("<Down>", lambda e: self._key_shift(-12))
@@ -505,9 +539,10 @@ class SynthApp:
         frame = tk.Frame(parent, bg=PANEL, pady=12)
         frame.pack(fill="x", padx=12)
 
+        # ── タイトルと説明 ──
         tk.Label(
             frame,
-            text="CONDITION VECTOR",
+            text="TIMBRE BLEND  (ノブの比率が音色埋め込みへの重みになります)",
             bg=PANEL,
             fg=DIM,
             font=("Courier", 8),
@@ -518,7 +553,7 @@ class SynthApp:
         knob_row.pack()
 
         self._knobs = {}
-        for name in ("screech", "acid", "pluck"):
+        for name in TIMBRE_NAMES:
             kb = Knob(
                 knob_row,
                 label=name.upper(),
@@ -528,6 +563,10 @@ class SynthApp:
             kb.pack(side="left", padx=18)
             self._knobs[name] = kb
 
+        # 初期値をセット (Screech=1.0)
+        self._knobs["screech"].value = 1.0
+
+        # ── GENERATEボタン ──
         btn_frame = tk.Frame(parent, bg=PANEL)
         btn_frame.pack(fill="x", padx=12, pady=6)
         self._gen_btn = tk.Button(
@@ -551,7 +590,6 @@ class SynthApp:
     def _build_waveform(self, parent):
         frame = tk.Frame(parent, bg=PANEL, pady=6)
         frame.pack(fill="both", expand=True, padx=12)
-
         tk.Label(
             frame,
             text="WAVEFORM PREVIEW",
@@ -560,7 +598,6 @@ class SynthApp:
             font=("Courier", 8),
         ).pack(anchor="w")
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=(2, 6))
-
         self._wave_view = WaveformView(frame, height=90)
         self._wave_view.pack(fill="both", expand=True)
 
@@ -569,11 +606,7 @@ class SynthApp:
         frame.pack(fill="both", expand=True)
 
         tk.Label(
-            frame,
-            text="COND VECTOR [4D]",
-            bg=PANEL2,
-            fg=DIM,
-            font=("Courier", 8),
+            frame, text="TIMBRE WEIGHTS", bg=PANEL2, fg=DIM, font=("Courier", 8)
         ).pack(anchor="w")
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=(2, 12))
 
@@ -612,7 +645,6 @@ class SynthApp:
             )
             tv.pack(side="right")
             self._bar_texts[key] = tv
-
             cv = tk.Canvas(row, height=6, bg="#1a1a1a", highlightthickness=0)
             cv.pack(fill="x", pady=(2, 0))
             fill = cv.create_rectangle(0, 0, 0, 6, fill=color, outline="")
@@ -621,12 +653,16 @@ class SynthApp:
 
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", pady=8)
         tk.Label(
-            frame, text="PYTHON OUTPUT", bg=PANEL2, fg=DIM, font=("Courier", 7)
+            frame,
+            text="BLEND VECTOR (normalized)",
+            bg=PANEL2,
+            fg=DIM,
+            font=("Courier", 7),
         ).pack(anchor="w")
 
         self._vec_text = tk.Text(
             frame,
-            height=6,
+            height=7,
             width=22,
             bg="#0a0a0a",
             fg=ACID_COL,
@@ -656,55 +692,63 @@ class SynthApp:
         self._update_vector_display()
 
     def _on_note_and_generate(self, midi):
-        """★ 鍵盤を押したとき: ピッチ更新 → 即座に生成・再生"""
         self._midi = midi
         note = midi_to_note_name(midi)
         freq = midi_to_freq(midi)
         pn = pitch_norm(midi)
-
         self._pitch_label.config(text=note)
         self._freq_label.config(
             text=f"{freq:.1f} Hz  |  MIDI {midi}  |  pitch_n = {pn:.3f}"
         )
         self._update_vector_display()
-
-        # 鍵盤クリックで即生成・再生
         self._generate()
 
     def _key_shift(self, delta):
         new = max(MIDI_MIN, min(MIDI_MAX, self._midi + delta))
         if new != self._midi:
-            self._keyboard.select(new)  # → _on_note_and_generate が呼ばれる
+            self._keyboard.select(new)
 
     def _update_vector_display(self):
+        # UIがまだ構築中の場合は何もしない
+        if not hasattr(self, "_bar_cvs"):
+            return
+
         pn = pitch_norm(self._midi)
-        values = {
-            "screech": self._params["screech"],
-            "acid": self._params["acid"],
-            "pluck": self._params["pluck"],
-            "pitch": pn,
-        }
-        for key, v in values.items():
-            cv = self._bar_cvs[key]
+        # 正規化済みブレンド比率を計算
+        raw = np.array(
+            [self._params[n] for n in TIMBRE_NAMES], dtype=np.float32
+        )
+        total = raw.sum()
+        norm = raw / total if total > 1e-6 else np.ones(3, dtype=np.float32) / 3
+
+        for i, name in enumerate(TIMBRE_NAMES):
+            v = norm[i]
+            cv = self._bar_cvs[name]
             cv.update_idletasks()
             w = cv.winfo_width()
             if w > 0:
-                cv.coords(self._bar_fills[key], 0, 0, int(w * v), 6)
-            self._bar_texts[key].config(text=f"{v:.2f}")
+                cv.coords(self._bar_fills[name], 0, 0, int(w * v), 6)
+            self._bar_texts[name].config(text=f"{v:.2f}")
 
-        s = self._params["screech"]
-        a = self._params["acid"]
-        p = self._params["pluck"]
+        # pitch バー (0〜1)
+        cv = self._bar_cvs["pitch"]
+        cv.update_idletasks()
+        w = cv.winfo_width()
+        if w > 0:
+            cv.coords(self._bar_fills["pitch"], 0, 0, int(w * pn), 6)
+        self._bar_texts["pitch"].config(text=f"{pn:.2f}")
+
+        # Python コード表示
         note = midi_to_note_name(self._midi)
         code = (
-            f"# Note: {note}  (MIDI {self._midi})\n"
-            f"pitch = {self._midi}\n"
-            f"cond  = (\n"
-            f"  {s:.3f},  # screech\n"
-            f"  {a:.3f},  # acid\n"
-            f"  {p:.3f},  # pluck\n"
-            f")\n"
-            f"# cond_vector = [{pn:.3f}, {s:.3f}, {a:.3f}, {p:.3f}]"
+            f"# Note: {note} (MIDI {self._midi})\n"
+            f"pitch     = {pn:.3f}\n"
+            f"# timbre blend (normalized):\n"
+            f"screech   = {norm[0]:.3f}\n"
+            f"acid      = {norm[1]:.3f}\n"
+            f"pluck     = {norm[2]:.3f}\n"
+            f"# timbre_id (argmax):\n"
+            f"timbre_id = {int(np.argmax(norm))}"
         )
         self._vec_text.config(state="normal")
         self._vec_text.delete("1.0", "end")
@@ -729,17 +773,11 @@ class SynthApp:
 
     def _generate_thread(self):
         try:
-            midi = self._midi
-            s = self._params["screech"]
-            a = self._params["acid"]
-            p = self._params["pluck"]
-
             waveform = (
-                self._run_model(midi, (s, a, p))
+                self._run_model()
                 if self.model is not None
-                else self._demo_waveform(midi, s, a, p)
+                else self._demo_waveform()
             )
-
             self.root.after(0, lambda: self._post_generate(waveform))
         except Exception as e:
             import traceback
@@ -753,51 +791,64 @@ class SynthApp:
             )
             self.root.after(0, self._reset_gen_btn)
 
-    def _run_model(self, midi, cond):
+    def _run_model(self):
+        """
+        新モデル API に対応した生成処理。
+
+        変更点:
+          旧: encoder(audio) → z   /  decoder([z, cond_4d])
+          新: generate_blend(pitch, timbre_weights)
+              └─ 内部で TimbreEmbedding.blend() を呼び、
+                 N(0,I) からサンプリングした z を Decoder に渡す
+
+        ノブの値はL1正規化して timbre_weights として渡す。
+        音色ブレンドが不要な場合 (単一音色を選びたい) は
+        generate(pitch, timbre_id) を使う方が高速。
+        """
         import tensorflow as tf
 
-        pn = pitch_norm(midi)
-        cond_vector = tf.constant([[pn, *cond]], dtype=tf.float32)
+        midi = self._midi
+        pn = np.float32(pitch_norm(midi))
 
-        ref = self.reference
-        if ref is None:
-            t = np.arange(TIME_LENGTH) / SR
-            ref = (0.5 * np.sin(2 * np.pi * midi_to_freq(midi) * t))[
-                :, None
-            ].astype(np.float32)
-        else:
-            ref = np.array(ref, dtype=np.float32)
-            if ref.ndim == 1:
-                ref = ref[:, None]
+        # pitch テンソル [1]
+        pitch_t = tf.constant([pn], dtype=tf.float32)
 
-        ref_batch = tf.constant(ref[None, :, :], dtype=tf.float32)
-        # encoder は波形のみを受け取る (cond_vector は decoder にだけ渡す)
-        z_mean, z_lv = self.model.encoder(ref_batch)
-        z = (
-            z_mean
-            + tf.exp(0.5 * z_lv) * tf.random.normal(tf.shape(z_mean)) * 0.1
-        )
-        x_hat = tf.squeeze(self.model.decoder([z, cond_vector])).numpy()
+        # timbre_weights テンソル [1, TIMBRE_VOCAB]  (L1正規化済み)
+        timbre_w = weights_to_tensor(self._params)
 
-        # NaN/Inf チェック
-        x_hat = np.nan_to_num(x_hat, nan=0.0, posinf=0.0, neginf=0.0)
-        nan_ratio = np.sum(x_hat == 0.0) / len(x_hat)
-        if nan_ratio > 0.9:
-            print(
-                f"[警告] 出力の{nan_ratio*100:.0f}%がNaN/Infでした。重みかリファレンスを確認してください。"
-            )
-        mx = np.max(np.abs(x_hat))
-        if mx > 1e-6:
-            x_hat = x_hat / mx * 0.95
+        # --- 生成 ---
+        # generate_blend: z ~ N(0,I) からサンプリング → Decoder → DSP合成
+        x_hat = self.model.generate_blend(pitch_t, timbre_w, temperature=1.0)
+        # x_hat: [1, TIME_LENGTH, 1]
+
+        waveform = tf.squeeze(x_hat).numpy()  # [TIME_LENGTH]
+        waveform = np.nan_to_num(waveform, nan=0.0, posinf=0.0, neginf=0.0)
+
+        # ピーク正規化
+        peak = np.max(np.abs(waveform))
+        if peak > 1e-6:
+            waveform = waveform / peak * 0.95
+
         if HAS_SF:
-            sf.write("generated.wav", x_hat, SR)
-        return x_hat
+            sf.write("generated.wav", waveform, SR)
 
-    def _demo_waveform(self, midi, screech, acid, pluck):
-        duration = 1.0
-        t = np.linspace(0, duration, int(SR * duration), endpoint=False)
+        return waveform.astype(np.float32)
+
+    def _demo_waveform(self):
+        """モデルなしのデモ波形 (動作確認用)"""
+        midi = self._midi
+        raw = np.array(
+            [self._params[n] for n in TIMBRE_NAMES], dtype=np.float32
+        )
+        total = raw.sum()
+        norm = raw / total if total > 1e-6 else np.ones(3) / 3
+        screech, acid, pluck = norm
+
+        duration = TIME_LENGTH / SR
+        t = np.linspace(0, duration, TIME_LENGTH, endpoint=False)
         phase = 2 * np.pi * midi_to_freq(midi) * t
         s = np.sin(phase)
+
         for h in range(3, 12, 2):
             s += acid * 0.5 / h * np.sin(phase * h)
         if screech > 0.01:
@@ -805,9 +856,10 @@ class SynthApp:
             s = np.tanh(s * (1 + screech * 2))
         if pluck > 0.01:
             s *= np.exp(-t * 8 * pluck)
-        mx = np.max(np.abs(s))
-        if mx > 1e-6:
-            s = s / mx * 0.90
+
+        peak = np.max(np.abs(s))
+        if peak > 1e-6:
+            s = s / peak * 0.90
         return s.astype(np.float32)
 
     def _post_generate(self, waveform):
@@ -839,27 +891,34 @@ class SynthApp:
 # ══════════════════════════════════════════════════════════════════════
 def main():
     model = None
-    reference = None
 
     if HAS_MODEL:
         try:
-            print("[1] モデル読み込み中...")
             import tensorflow as tf
 
+            print("[1] モデルを構築中...")
             model = TimeWiseCVAE()
-            dummy_x = tf.zeros((1, TIME_LENGTH, 1))
-            dummy_cond = tf.zeros((1, 4))
-            model((dummy_x, dummy_cond), training=False)
+
+            # ── ダミー入力でビルド (新API: audio, pitch, timbre_id のタプル) ──
+            dummy_audio = tf.zeros([1, TIME_LENGTH, 1], dtype=tf.float32)
+            dummy_pitch = tf.zeros([1], dtype=tf.float32)
+            dummy_timbre = tf.zeros([1], dtype=tf.int32)
+            model((dummy_audio, dummy_pitch, dummy_timbre), training=False)
             print(f"    ✓ モデルビルド完了 (params: {model.count_params():,})")
 
-            ckpt = "weights/best_model.weights.h5"
-            model.load_weights(ckpt)
-            print(f"    ✓ 重みを読み込みました: {ckpt}")
+            # ── 重みの読み込み ──
+            import os
 
-            print("[2] リファレンス音声読み込み中...")
-            reference = load_wav("datasets/0021.wav")
-            reference = crop_or_pad(reference, TIME_LENGTH)
-            print("    ✓ リファレンス読み込み完了")
+            ckpt = "weights/best_model.weights.h5"
+            if os.path.exists(ckpt):
+                model.load_weights(ckpt)
+                print(f"    ✓ 重みを読み込みました: {ckpt}")
+            else:
+                print(f"    ⚠ 重みファイルが見つかりません: {ckpt}")
+                print(
+                    f"    　 学習前のデモモードで起動します (train.py を実行してください)"
+                )
+                model = None
 
         except Exception as e:
             import traceback
@@ -872,7 +931,7 @@ def main():
             model = None
 
     root = tk.Tk()
-    SynthApp(root, model=model, reference=reference)
+    SynthApp(root, model=model)
     root.mainloop()
 
 
