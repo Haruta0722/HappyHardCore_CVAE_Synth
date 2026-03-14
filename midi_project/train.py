@@ -198,6 +198,17 @@ class AudioDataset:
             ds = ds.shuffle(buffer_size=self.n, reshuffle_each_iteration=True)
 
         ds = ds.batch(self.batch_size, drop_remainder=False)
+
+        # Keras の model.fit() は (inputs, targets) の2要素タプルを期待する。
+        # 3要素タプル (audio, pitch, timbre_id) をそのまま渡すと
+        # audio=inputs / pitch=targets と誤解釈されてしまう。
+        # train_step が data をまるごと受け取れるよう
+        # ((audio, pitch, timbre_id), dummy) の形にラップする。
+        ds = ds.map(
+            lambda audio, pitch, tid: ((audio, pitch, tid), tf.constant(0)),
+            num_parallel_calls=tf.data.AUTOTUNE,
+        )
+
         ds = ds.prefetch(tf.data.AUTOTUNE)
         return ds
 

@@ -316,7 +316,7 @@ class TimeWiseCVAE(tf.keras.Model):
         return self.timbre_embedding(pitch, timbre_id)
 
     def _pitch_to_f0(self, pitch):
-        midi = pitch * (SR - 36.0) / SR  # ← 使わない。下記の正しい式を使用
+        """正規化ピッチ → Hz  (pitch ∈ [0,1], MIDI 36〜71)"""
         midi = pitch * 35.0 + 36.0
         return 440.0 * tf.pow(2.0, (midi - 69.0) / 12.0)
 
@@ -338,7 +338,18 @@ class TimeWiseCVAE(tf.keras.Model):
     # call
     # ----------------------------------------------------------
     def call(self, inputs, training=None):
-        audio, pitch, timbre_id = inputs
+        # Keras の model.fit() はデータセットの構造に応じて
+        # inputs にタプル全体 or 先頭要素だけを渡す場合がある。
+        # train_step で直接処理するため、call() はパススルーのみ。
+        if isinstance(inputs, (list, tuple)) and len(inputs) == 3:
+            audio, pitch, timbre_id = inputs
+        else:
+            # fit() から audio だけ渡された場合のフォールバック
+            # (実際の推論は train_step / generate / reconstruct で行う)
+            audio = inputs
+            pitch = tf.zeros([tf.shape(audio)[0]], dtype=tf.float32)
+            timbre_id = tf.zeros([tf.shape(audio)[0]], dtype=tf.int32)
+
         cond = self._make_cond(pitch, timbre_id)
         z_mean, z_logvar = self.encoder([audio, cond], training=training)
         z = sample_z(z_mean, z_logvar)
@@ -470,7 +481,8 @@ class TimeWiseCVAE(tf.keras.Model):
     # train_step
     # ----------------------------------------------------------
     def train_step(self, data):
-        audio, pitch, timbre_id = data
+        # AudioDataset.build() が ((audio, pitch, timbre_id), dummy) の形で渡す
+        (audio, pitch, timbre_id), _ = data
 
         with tf.GradientTape() as tape:
             cond = self._make_cond(pitch, timbre_id)
