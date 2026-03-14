@@ -467,7 +467,73 @@ class TimeWiseCVAE(tf.keras.Model):
         return audio_out[:, :, None]
 
     # ----------------------------------------------------------
-    # KLスケジュール
+    # test_step  (val_loss の計算)
+    # ----------------------------------------------------------
+    def test_step(self, data):
+        """
+        validation_data に対して train_step と同じ損失を計算する。
+        compile(loss=...) を使わずに val_loss を返すために必要。
+        """
+        (audio, pitch, timbre_id), _ = data
+
+        cond = self._make_cond(pitch, timbre_id)
+
+        z_mean, z_logvar = self.encoder([audio, cond], training=False)
+        z_logvar = tf.clip_by_value(z_logvar, -8.0, 2.0)
+        z = tf.clip_by_value(sample_z(z_mean, z_logvar), -10.0, 10.0)
+
+        amps, harm, noise = self.decoder([z, cond], training=False)
+
+        f0_hz = self._pitch_to_f0(pitch)
+        x_hat_audio = self._synthesize(amps, harm, noise, f0_hz)[
+            :, :TIME_LENGTH
+        ]
+
+        x_target = tf.clip_by_value(tf.squeeze(audio, axis=-1), -1.0, 1.0)
+        x_hat_sq = tf.clip_by_value(x_hat_audio, -1.0, 1.0)
+
+        s = self._safe
+        recon = s(tf.reduce_mean(tf.square(x_target - x_hat_sq)))
+        stft_l, mel_l, _ = Loss(x_target, x_hat_sq, fft_size=2048, hop_size=512)
+        stft_l = s(stft_l)
+        mel_l = s(mel_l)
+        hf_l = s(compute_high_freq_emphasis_loss(x_target, x_hat_sq))
+        flux_l = s(compute_spectral_flux_loss(x_target, x_hat_sq), 0.1)
+
+        kl_per_dim = -0.5 * (
+            1.0 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
+        )
+        kl_mean = tf.reduce_mean(kl_per_dim, axis=[0, 1])
+        kl = s(
+            tf.clip_by_value(
+                tf.reduce_mean(tf.maximum(kl_mean, self.free_bits)), 0.0, 100.0
+            ),
+            0.5,
+        )
+
+        kl_w = self.compute_kl_weight()
+        loss = (
+            recon * 5.0
+            + stft_l * 3.0
+            + mel_l * 4.0
+            + hf_l * 2.0
+            + flux_l * 2.0
+            + kl * kl_w
+        )
+        loss = s(loss, 1000.0)
+
+        return {
+            "loss": loss,
+            "recon": recon,
+            "stft": stft_l,
+            "mel": mel_l,
+            "high_freq": hf_l,
+            "spectral_flux": flux_l,
+            "kl": kl,
+            "kl_weight": kl_w,
+        }
+
+    # ----------------------------------------------------------
     # ----------------------------------------------------------
     def compute_kl_weight(self):
         step = tf.cast(self.optimizer.iterations, tf.float32)

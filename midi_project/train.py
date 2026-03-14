@@ -329,7 +329,9 @@ def build_and_train(cfg: dict):
     # オプティマイザ・コンパイル
     # -----------------------------------------------------------------
     optimizer = tf.keras.optimizers.Adam(learning_rate=cfg["lr"])
-    model.compile(optimizer=optimizer)
+    # train_step / test_step を完全自前実装しているため loss= は不要。
+    # run_eagerly=False のままグラフモードで高速に動作する。
+    model.compile(optimizer=optimizer, run_eagerly=False)
 
     # -----------------------------------------------------------------
     # チェックポイントから再開
