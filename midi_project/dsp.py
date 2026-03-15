@@ -1,237 +1,617 @@
 """
-dsp.py  ―  DDSPシンセサイザーモジュール
+dsp.py  ―  DDSPシンセサイザーモジュール (モジュール分離版)
 
-【役割】
-  VAE (cvae.py) が出力した DDSPパラメータを受け取り、音声波形を合成する。
-  学習パラメータを一切持たない純粋なDSP処理のみで構成されており、
-  TensorFlow に依存しない NumPy 版も提供する。
+【設計思想】
+  各DSPモジュールは独立しており、GUIから個別に操作・可視化できる。
+  Decoderはパラメータを推論するだけで、音声生成はこのファイルが担う。
 
-【ハード化時の使い方】
-  DSP専用マイコンはこのファイルだけを参照すればよい。
-  VAE側から受け取るペイロード (DDSPParams) の構造:
+【DSPパラメータ構造】  DDSPParams (dataclass)
+  ┌─ Oscillator ──────────────────────────────────────────────┐
+  │  f0_hz            : float  基本周波数 [Hz]                 │
+  │  harmonic_amps    : [NUM_HARMONICS]  各倍音の相対振幅       │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ Envelope (ADSR) ─────────────────────────────────────────┐
+  │  attack           : float 0〜1  アタック時間               │
+  │  decay            : float 0〜1  ディケイ時間               │
+  │  sustain          : float 0〜1  サステインレベル            │
+  │  release          : float 0〜1  リリース時間               │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ Filter ──────────────────────────────────────────────────┐
+  │  cutoff           : float 0〜1  カットオフ周波数 (正規化)   │
+  │  resonance        : float 0〜1  レゾナンス                 │
+  └───────────────────────────────────────────────────────────┘
+  ┌─ Noise ────────────────────────────────────────────────────┐
+  │  noise_amount     : float 0〜1  ノイズ混合量               │
+  └───────────────────────────────────────────────────────────┘
 
-    {
-      "amplitudes":             float32 [LATENT_STEPS, 1],
-      "harmonic_distribution":  float32 [LATENT_STEPS, NUM_HARMONICS],
-      "noise_magnitudes":       float32 [LATENT_STEPS, NOISE_FIR_LEN],
-      "f0_hz":                  float32  (スカラー)
-    }
+【ハード化時のデータフロー】
+  VAEマイコン → DDSPParams (辞書) → DSPマイコン → synthesize_numpy()
+  DSPマイコンは TensorFlow 不要。numpy だけで動作する。
 
-  受け取ったペイロードを NumPy版 synthesize_numpy() に渡すだけで音声が得られる。
-
-【モジュール構成】
-  upsample_frames()          フレーム→サンプルの補間 (TF版)
-  HarmonicSynthesizer        加算合成シンセ (TFレイヤー, 学習時用)
-  FilteredNoiseSynthesizer   ノイズシンセ   (TFレイヤー, 学習時用)
-  synthesize_numpy()         NumPy実装 (マイコン・推論専用)
+【GUIでの操作】
+  各パラメータを直接スライダー/ノブで上書きしてから synthesize_numpy() を呼ぶ。
+  再現性が保たれる (乱数要素はノイズだけ)。
 """
 
+from __future__ import annotations
+from dataclasses import dataclass, field, asdict
 import numpy as np
 
-# ── TensorFlow は任意依存 (NumPy版のみ使う場合は不要) ───────────────────
 try:
     import tensorflow as tf
+
     HAS_TF = True
 except ImportError:
     HAS_TF = False
 
-from config import SR, TIME_LENGTH, NUM_HARMONICS, NOISE_FIR_LEN
+from config import SR, TIME_LENGTH, NUM_HARMONICS
 
 
 # ============================================================
-# ユーティリティ: フレーム → サンプルのアップサンプル (TF版)
+# DDSPParams  ― パラメータをひとまとめにするデータクラス
 # ============================================================
-def upsample_frames(x, target_length):
+@dataclass
+class DDSPParams:
     """
-    [batch, frames, ch] → [batch, target_length, ch]  bilinear補間 (TF版)
+    DSPモジュール全体のパラメータ。
+    Decoderの出力であり、GUIで直接操作できる単位。
 
-    HarmonicSynthesizer / FilteredNoiseSynthesizer の内部で使用。
-    """
-    x = tf.expand_dims(x, axis=2)
-    x = tf.image.resize(x, [target_length, 1], method="bilinear")
-    x = tf.squeeze(x, axis=2)
-    return x
-
-
-def upsample_frames_numpy(x, target_length):
-    """
-    [frames, ch] → [target_length, ch]  線形補間 (NumPy版)
-
-    synthesize_numpy() の内部で使用。マイコンでも動作する。
-    """
-    frames, ch = x.shape
-    result = np.zeros((target_length, ch), dtype=np.float32)
-    for c in range(ch):
-        result[:, c] = np.interp(
-            np.linspace(0, frames - 1, target_length),
-            np.arange(frames),
-            x[:, c],
-        )
-    return result
-
-
-# ============================================================
-# HarmonicSynthesizer  (TFレイヤー版 / 学習・推論用)
-# ============================================================
-class HarmonicSynthesizer(tf.keras.layers.Layer if HAS_TF else object):
-    """
-    加算合成シンセサイザー (DDSP論文 Section 3.1)
-
-    cumsum による累積位相計算でフレーム境界の位相連続性を保証。
-
-    入力:
-      f0_hz                : 基本周波数 [batch]
-      amplitudes           : 全体振幅   [batch, frames, 1]
-      harmonic_distribution: 各倍音の相対比率 [batch, frames, NUM_HARMONICS]
-    出力:
-      audio: [batch, TIME_LENGTH]
+    すべてのフィールドは 0〜1 に正規化されている
+    (f0_hz だけ例外でHz値を直接持つ)。
     """
 
-    def __init__(self, sr=SR, time_length=TIME_LENGTH):
-        super().__init__(name="harmonic_synth")
-        self.sr          = float(sr)
-        self.time_length = time_length
+    # Oscillator
+    f0_hz: float = 440.0
+    harmonic_amps: list[float] = field(
+        default_factory=lambda: [1.0] + [0.0] * (NUM_HARMONICS - 1)
+    )
 
-    def call(self, f0_hz, amplitudes, harmonic_distribution):
-        num_harmonics = tf.shape(harmonic_distribution)[2]
-        time_frames   = tf.shape(amplitudes)[1]
+    # Envelope (ADSR)
+    attack: float = 0.1  # 0〜1 → 実時間は adsr_to_seconds() で変換
+    decay: float = 0.2
+    sustain: float = 0.7
+    release: float = 0.3
 
-        # 各倍音の絶対振幅  [batch, frames, num_harmonics]
-        harm_amps = amplitudes * harmonic_distribution
+    # Filter
+    cutoff: float = 1.0  # 0〜1 → Hz は cutoff_to_hz() で変換
+    resonance: float = 0.0  # 0〜1
 
-        # f0 → 各倍音周波数  [batch, frames, num_harmonics]
-        f0_frames  = tf.reshape(f0_hz, [-1, 1, 1])
-        f0_frames  = tf.tile(f0_frames, [1, time_frames, 1])
-        harm_nums  = tf.cast(tf.range(1, num_harmonics + 1), tf.float32)
-        harm_freqs = f0_frames * tf.reshape(harm_nums, [1, 1, -1])
+    # Noise
+    noise_amount: float = 0.0  # 0〜1
 
-        # フレーム → サンプルにアップサンプル
-        harm_amps  = upsample_frames(harm_amps,  self.time_length)
-        harm_freqs = upsample_frames(harm_freqs, self.time_length)
+    def to_dict(self) -> dict:
+        """マイコン送信用辞書に変換 (numpy → list)"""
+        d = asdict(self)
+        if isinstance(d["harmonic_amps"], np.ndarray):
+            d["harmonic_amps"] = d["harmonic_amps"].tolist()
+        return d
 
-        harm_amps  = tf.clip_by_value(harm_amps,  0.0, 2.0)
-        harm_freqs = tf.clip_by_value(harm_freqs, 0.0, self.sr / 2.0)
+    @classmethod
+    def from_dict(cls, d: dict) -> "DDSPParams":
+        """辞書から復元"""
+        return cls(**d)
 
-        # 累積位相 → sin 波
-        delta_phase = 2.0 * np.pi * harm_freqs / self.sr
-        phase       = tf.cumsum(delta_phase, axis=1)
-        harmonics   = harm_amps * tf.sin(phase)
-        audio       = tf.reduce_sum(harmonics, axis=-1)
-        return tf.clip_by_value(audio, -10.0, 10.0)
+    def clamp(self) -> "DDSPParams":
+        """全パラメータを有効範囲にクランプして返す"""
+        self.attack = float(np.clip(self.attack, 0.0, 1.0))
+        self.decay = float(np.clip(self.decay, 0.0, 1.0))
+        self.sustain = float(np.clip(self.sustain, 0.0, 1.0))
+        self.release = float(np.clip(self.release, 0.0, 1.0))
+        self.cutoff = float(np.clip(self.cutoff, 0.0, 1.0))
+        self.resonance = float(np.clip(self.resonance, 0.0, 1.0))
+        self.noise_amount = float(np.clip(self.noise_amount, 0.0, 1.0))
+        self.harmonic_amps = list(np.clip(self.harmonic_amps, 0.0, 1.0))
+        return self
 
 
 # ============================================================
-# FilteredNoiseSynthesizer  (TFレイヤー版 / 学習・推論用)
+# パラメータ変換ユーティリティ
 # ============================================================
-class FilteredNoiseSynthesizer(tf.keras.layers.Layer if HAS_TF else object):
+def adsr_to_seconds(
+    value: float, param: str, total: float = TIME_LENGTH / SR
+) -> float:
     """
-    ノイズシンセサイザー (DDSP論文 Section 3.2)
+    正規化ADSR値 [0,1] → 秒数
 
-    ホワイトノイズを noise_magnitudes のフレームごとの平均振幅で整形する。
-
-    入力:
-      noise_magnitudes: [batch, frames, NOISE_FIR_LEN]
-    出力:
-      audio: [batch, TIME_LENGTH]
+    attack, decay, release: 0〜total*0.5 秒
+    sustain: 0〜1 (レベルなので変換不要)
     """
+    if param == "sustain":
+        return value
+    max_sec = total * 0.5
+    # 指数スケールで短い時間に解像度を集中させる
+    return float(np.exp(np.log(0.001 + max_sec) * value) - 0.001 + 0.001)
 
-    def __init__(self, sr=SR, time_length=TIME_LENGTH):
-        super().__init__(name="noise_synth")
-        self.sr          = sr
-        self.time_length = time_length
 
-    def call(self, noise_magnitudes):
-        batch_size = tf.shape(noise_magnitudes)[0]
-        noise      = tf.random.normal([batch_size, self.time_length])
-
-        envelope = tf.reduce_mean(noise_magnitudes, axis=-1, keepdims=True)
-        envelope = upsample_frames(envelope, self.time_length)
-        envelope = tf.squeeze(envelope, axis=-1)
-        envelope = tf.clip_by_value(envelope, 0.0, 1.0)
-
-        return tf.clip_by_value(noise * envelope, -2.0, 2.0)
+def cutoff_to_hz(cutoff: float, sr: int = SR) -> float:
+    """
+    正規化カットオフ [0,1] → Hz (対数スケール: 20Hz〜SR/2)
+    """
+    min_hz = 20.0
+    max_hz = sr / 2.0
+    return float(min_hz * (max_hz / min_hz) ** cutoff)
 
 
 # ============================================================
-# synthesize_numpy()  ― NumPy実装 (マイコン・推論専用)
+# モジュール1: Oscillator  加算合成シンセ
 # ============================================================
-def synthesize_numpy(
-    f0_hz:                 float,
-    amplitudes:            np.ndarray,   # [LATENT_STEPS, 1]
-    harmonic_distribution: np.ndarray,   # [LATENT_STEPS, NUM_HARMONICS]
-    noise_magnitudes:      np.ndarray,   # [LATENT_STEPS, NOISE_FIR_LEN]
-    sr:          int   = SR,
-    time_length: int   = TIME_LENGTH,
-    noise_gain:  float = 0.1,
-    seed:        int   = None,
+def oscillator_numpy(
+    f0_hz: float,
+    harmonic_amps: np.ndarray,  # [NUM_HARMONICS]  0〜1
+    time_length: int = TIME_LENGTH,
+    sr: int = SR,
 ) -> np.ndarray:
     """
-    DDSPパラメータから音声波形を合成する (NumPy実装)。
+    加算合成で倍音波形を生成する。
 
-    TensorFlow 不要。マイコンや軽量環境で動作する。
-
-    Args:
-        f0_hz                : 基本周波数 [Hz]  (スカラー)
-        amplitudes           : 全体振幅エンベロープ [LATENT_STEPS, 1]
-        harmonic_distribution: 各倍音の相対比率   [LATENT_STEPS, NUM_HARMONICS]
-        noise_magnitudes     : ノイズFIRフィルタ係数 [LATENT_STEPS, NOISE_FIR_LEN]
-        sr                   : サンプリングレート
-        time_length          : 出力サンプル数
-        noise_gain           : ノイズの混合比率 (デフォルト 0.1)
-        seed                 : 乱数シード (再現性が必要な場合に設定)
+    累積位相を使うことで位相連続性を保証。
+    harmonic_amps は各倍音の相対振幅 (softmaxで合計1が望ましい)。
 
     Returns:
-        audio: float32 ndarray [time_length]  (tanh 適用済み, -1〜1)
+        audio: [time_length]  float32
+    """
+    harmonic_amps = np.array(harmonic_amps, dtype=np.float32)
+    harmonic_amps = np.clip(harmonic_amps, 0.0, 1.0)
+    num_harmonics = len(harmonic_amps)
 
-    使用例 (DSP マイコン側):
-        import numpy as np
-        from dsp import synthesize_numpy
+    # 各倍音の周波数 [num_harmonics]
+    harm_nums = np.arange(1, num_harmonics + 1, dtype=np.float32)
+    harm_freqs = f0_hz * harm_nums  # [H]
+    harm_freqs = np.clip(harm_freqs, 0.0, sr / 2.0)
 
-        payload = receive_from_vae_mcu()   # 通信で受け取るペイロード
-        audio = synthesize_numpy(
-            f0_hz                 = payload["f0_hz"],
-            amplitudes            = np.array(payload["amplitudes"]),
-            harmonic_distribution = np.array(payload["harmonic_distribution"]),
-            noise_magnitudes      = np.array(payload["noise_magnitudes"]),
-        )
-        play_audio(audio)
+    # サンプルごとの位相増分 [time, H]
+    delta_phase = 2.0 * np.pi * harm_freqs[None, :] / sr  # [1, H] broadcast
+    phase = np.cumsum(
+        np.tile(delta_phase, (time_length, 1)), axis=0
+    )  # [time, H]
+
+    # 合成
+    audio = (harmonic_amps[None, :] * np.sin(phase)).sum(axis=1)  # [time]
+    return audio.astype(np.float32)
+
+
+# ============================================================
+# モジュール2: ADSR Envelope
+# ============================================================
+def adsr_envelope_numpy(
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+    time_length: int = TIME_LENGTH,
+    sr: int = SR,
+) -> np.ndarray:
+    """
+    ADSRエンベロープを生成する。
+
+    Args:
+        attack   : アタック時間 [秒]
+        decay    : ディケイ時間 [秒]
+        sustain  : サステインレベル [0〜1]
+        release  : リリース時間 [秒]  (音声末尾からリリース開始)
+        time_length: サンプル数
+        sr       : サンプリングレート
+
+    Returns:
+        envelope: [time_length]  float32  (0〜1)
+    """
+    t = np.linspace(
+        0.0, time_length / sr, time_length, endpoint=False, dtype=np.float32
+    )
+    env = np.zeros(time_length, dtype=np.float32)
+    total_t = time_length / sr
+
+    a_end = attack
+    d_end = attack + decay
+    r_start = max(d_end, total_t - release)
+
+    for i, ti in enumerate(t):
+        if ti < a_end:
+            # Attack: 0 → 1
+            env[i] = ti / (a_end + 1e-6)
+        elif ti < d_end:
+            # Decay: 1 → sustain
+            env[i] = 1.0 - (1.0 - sustain) * (ti - a_end) / (decay + 1e-6)
+        elif ti < r_start:
+            # Sustain
+            env[i] = sustain
+        else:
+            # Release: sustain → 0
+            env[i] = sustain * max(0.0, 1.0 - (ti - r_start) / (release + 1e-6))
+
+    return np.clip(env, 0.0, 1.0)
+
+
+def adsr_envelope_numpy_fast(
+    attack: float,
+    decay: float,
+    sustain: float,
+    release: float,
+    time_length: int = TIME_LENGTH,
+    sr: int = SR,
+) -> np.ndarray:
+    """adsr_envelope_numpy のベクトル化版 (高速)"""
+    t = np.linspace(
+        0.0, time_length / sr, time_length, endpoint=False, dtype=np.float32
+    )
+    total_t = time_length / sr
+
+    a_end = float(attack)
+    d_end = float(attack + decay)
+    r_start = float(max(d_end, total_t - release))
+
+    env = np.where(
+        t < a_end,
+        t / (a_end + 1e-6),
+        np.where(
+            t < d_end,
+            1.0 - (1.0 - sustain) * (t - a_end) / (decay + 1e-6),
+            np.where(
+                t < r_start,
+                sustain,
+                sustain
+                * np.clip(1.0 - (t - r_start) / (release + 1e-6), 0.0, 1.0),
+            ),
+        ),
+    )
+    return np.clip(env, 0.0, 1.0).astype(np.float32)
+
+
+# ============================================================
+# モジュール3: State Variable Filter (SVF)
+# ============================================================
+def svf_filter_numpy(
+    audio: np.ndarray,  # [time_length]
+    cutoff: float,  # 0〜1 (正規化)
+    resonance: float,  # 0〜1
+    mode: str = "lowpass",  # "lowpass" | "highpass" | "bandpass"
+    sr: int = SR,
+) -> np.ndarray:
+    """
+    State Variable Filter (SVF) のNumPy実装。
+
+    サンプルごとにループするため低速だが、マイコンでも動作する。
+    cutoff=1.0 でほぼ全域通過、cutoff=0.0 でほぼ全域遮断。
+    resonance=0.0 でフラット、resonance=1.0 でセルフオシレーション寸前。
+
+    Args:
+        audio     : 入力波形 [time_length]
+        cutoff    : 正規化カットオフ [0〜1]
+        resonance : レゾナンス [0〜1]
+        mode      : フィルタモード
+        sr        : サンプリングレート
+
+    Returns:
+        filtered: [time_length]  float32
+    """
+    cutoff_hz = cutoff_to_hz(cutoff, sr)
+    # SVFの係数
+    f = 2.0 * np.sin(np.pi * cutoff_hz / sr)
+    f = np.clip(f, 0.0, 1.0)
+    q = 1.0 - resonance * 0.99  # Q: 1.0(フラット)→0.01(高共振)
+
+    n = len(audio)
+    out = np.zeros(n, dtype=np.float32)
+    lp = 0.0  # ローパス状態
+    bp = 0.0  # バンドパス状態
+
+    for i in range(n):
+        x = float(audio[i])
+        hp = x - lp - q * bp
+        bp = f * hp + bp
+        lp = f * bp + lp
+
+        if mode == "lowpass":
+            out[i] = lp
+        elif mode == "highpass":
+            out[i] = hp
+        elif mode == "bandpass":
+            out[i] = bp
+
+    return np.clip(out, -2.0, 2.0).astype(np.float32)
+
+
+def svf_filter_numpy_fast(
+    audio: np.ndarray,
+    cutoff: float,
+    resonance: float,
+    mode: str = "lowpass",
+    sr: int = SR,
+) -> np.ndarray:
+    """
+    SVFのベクトル化近似版。
+    完全なサンプル単位ループの代わりにチャンク処理で高速化。
+    マイコン用途には svf_filter_numpy() を使うこと。
+    """
+    from scipy.signal import butter, sosfilt
+
+    cutoff_hz = float(np.clip(cutoff_to_hz(cutoff, sr), 20.0, sr / 2.0 - 1.0))
+    q_factor = float(np.clip(0.5 + resonance * 9.5, 0.5, 10.0))
+
+    nyq = sr / 2.0
+    norm = cutoff_hz / nyq
+
+    try:
+        if mode == "lowpass":
+            sos = butter(2, norm, btype="low", output="sos")
+        elif mode == "highpass":
+            sos = butter(2, norm, btype="high", output="sos")
+        else:
+            bw = norm / q_factor
+            low = max(1e-4, norm - bw / 2)
+            high = min(0.9999, norm + bw / 2)
+            sos = butter(2, [low, high], btype="band", output="sos")
+        return sosfilt(sos, audio).astype(np.float32)
+    except Exception:
+        return audio.astype(np.float32)
+
+
+# ============================================================
+# モジュール4: Noise Generator
+# ============================================================
+def noise_generator_numpy(
+    noise_amount: float,
+    time_length: int = TIME_LENGTH,
+    seed: int = None,
+) -> np.ndarray:
+    """
+    ホワイトノイズを生成して noise_amount でスケールする。
+
+    Returns:
+        noise: [time_length]  float32
     """
     if seed is not None:
         np.random.seed(seed)
+    noise = np.random.randn(time_length).astype(np.float32)
+    return noise * float(np.clip(noise_amount, 0.0, 1.0))
 
-    num_harmonics = harmonic_distribution.shape[1]
 
-    # ── 加算合成 ──────────────────────────────────────────────────────
-    # 各倍音の絶対振幅  [LATENT_STEPS, num_harmonics]
-    harm_amps = amplitudes * harmonic_distribution   # broadcast: [steps,1] * [steps,H]
+# ============================================================
+# メイン合成関数  synthesize_numpy()
+# ============================================================
+def synthesize_numpy(
+    params: DDSPParams,
+    sr: int = SR,
+    time_length: int = TIME_LENGTH,
+    fast_filter: bool = True,
+    seed: int = None,
+) -> np.ndarray:
+    """
+    DDSPParams から音声波形を合成する。
 
-    # フレーム → サンプルにアップサンプル
-    harm_amps_up = upsample_frames_numpy(harm_amps, time_length)   # [time, H]
+    処理フロー:
+      1. Oscillator  → 倍音波形
+      2. ADSR        → 振幅エンベロープ
+      3. Filter      → カットオフ / レゾナンス
+      4. Noise       → ノイズ混合
+      5. tanh        → クリッピング
 
-    # 各倍音の周波数  [LATENT_STEPS, num_harmonics]
-    harm_nums  = np.arange(1, num_harmonics + 1, dtype=np.float32)
-    harm_freqs = np.full((harmonic_distribution.shape[0], num_harmonics),
-                         f0_hz, dtype=np.float32) * harm_nums[None, :]
+    Args:
+        params      : DDSPParams インスタンス
+        sr          : サンプリングレート
+        time_length : 出力サンプル数
+        fast_filter : True = scipy版フィルタ(高速), False = SVFループ版(マイコン向け)
+        seed        : 乱数シード
 
-    harm_freqs_up = upsample_frames_numpy(harm_freqs, time_length)  # [time, H]
-    harm_freqs_up = np.clip(harm_freqs_up, 0.0, sr / 2.0)
-    harm_amps_up  = np.clip(harm_amps_up, 0.0, 2.0)
+    Returns:
+        audio: float32 [time_length]  (-1〜1)
 
-    # 累積位相で sin 波を生成 (位相連続性保証)
-    delta_phase   = 2.0 * np.pi * harm_freqs_up / sr   # [time, H]
-    phase         = np.cumsum(delta_phase, axis=0)      # [time, H]
-    harmonics     = harm_amps_up * np.sin(phase)        # [time, H]
-    audio_harmonic = harmonics.sum(axis=1)              # [time]
+    使用例 (DSPマイコン側):
+        from dsp import DDSPParams, synthesize_numpy
+        params = DDSPParams.from_dict(uart.receive())
+        audio  = synthesize_numpy(params, fast_filter=False)
+        play(audio)
+    """
+    params = params.clamp()
 
-    # ── ノイズ合成 ────────────────────────────────────────────────────
-    noise_env = noise_magnitudes.mean(axis=1, keepdims=True)   # [steps, 1]
-    noise_env_up = upsample_frames_numpy(noise_env, time_length)[:, 0]  # [time]
-    noise_env_up = np.clip(noise_env_up, 0.0, 1.0)
+    # --- 1. Oscillator ---
+    audio = oscillator_numpy(
+        f0_hz=params.f0_hz,
+        harmonic_amps=np.array(params.harmonic_amps, dtype=np.float32),
+        time_length=time_length,
+        sr=sr,
+    )
 
-    white_noise   = np.random.randn(time_length).astype(np.float32)
-    audio_noise   = white_noise * noise_env_up
+    # --- 2. ADSR Envelope ---
+    a_sec = adsr_to_seconds(params.attack, "attack", time_length / sr)
+    d_sec = adsr_to_seconds(params.decay, "decay", time_length / sr)
+    r_sec = adsr_to_seconds(params.release, "release", time_length / sr)
+    s_lv = params.sustain  # sustain はレベルなので変換不要
 
-    # ── ミックス & tanh ───────────────────────────────────────────────
-    audio = audio_harmonic + audio_noise * noise_gain
+    envelope = adsr_envelope_numpy_fast(
+        a_sec, d_sec, s_lv, r_sec, time_length, sr
+    )
+    audio = audio * envelope
+
+    # --- 3. Filter ---
+    if params.cutoff < 0.999:  # cutoff=1.0 はフルオープン→スキップ
+        if fast_filter:
+            audio = svf_filter_numpy_fast(
+                audio, params.cutoff, params.resonance, mode="lowpass", sr=sr
+            )
+        else:
+            audio = svf_filter_numpy(
+                audio, params.cutoff, params.resonance, mode="lowpass", sr=sr
+            )
+
+    # --- 4. Noise ---
+    if params.noise_amount > 1e-4:
+        noise = noise_generator_numpy(params.noise_amount, time_length, seed)
+        audio = audio + noise
+
+    # --- 5. tanh クリッピング ---
     audio = np.tanh(audio).astype(np.float32)
     return audio
+
+
+# ============================================================
+# TFレイヤー版  (学習時に cvae.py から使用)
+# ============================================================
+if HAS_TF:
+
+    def upsample_frames(x, target_length):
+        """[batch, frames, ch] → [batch, target_length, ch]"""
+        x = tf.expand_dims(x, axis=2)
+        x = tf.image.resize(x, [target_length, 1], method="bilinear")
+        x = tf.squeeze(x, axis=2)
+        return x
+
+    class OscillatorLayer(tf.keras.layers.Layer):
+        """加算合成シンセ (TFレイヤー版・学習用)"""
+
+        def __init__(self, sr=SR, time_length=TIME_LENGTH):
+            super().__init__(name="oscillator")
+            self.sr = float(sr)
+            self.time_length = time_length
+
+        def call(self, f0_hz, harmonic_amps):
+            """
+            Args:
+                f0_hz        : [batch]
+                harmonic_amps: [batch, NUM_HARMONICS]  (softmax済み)
+            Returns:
+                audio: [batch, time_length]
+            """
+            num_harmonics = tf.shape(harmonic_amps)[1]
+
+            harm_nums = tf.cast(tf.range(1, num_harmonics + 1), tf.float32)
+            harm_freqs = tf.reshape(f0_hz, [-1, 1]) * tf.reshape(
+                harm_nums, [1, -1]
+            )
+            harm_freqs = tf.clip_by_value(harm_freqs, 0.0, self.sr / 2.0)
+
+            # [batch, time, H]
+            delta = (
+                2.0
+                * np.pi
+                * tf.reshape(harm_freqs, [-1, 1, num_harmonics])
+                / self.sr
+            )
+            delta = tf.tile(delta, [1, self.time_length, 1])
+            phase = tf.cumsum(delta, axis=1)
+
+            amps = tf.reshape(harmonic_amps, [-1, 1, num_harmonics])
+            audio = tf.reduce_sum(amps * tf.sin(phase), axis=-1)
+            return tf.clip_by_value(audio, -10.0, 10.0)
+
+    class ADSRLayer(tf.keras.layers.Layer):
+        """ADSRエンベロープ生成 (TFレイヤー版・学習用)"""
+
+        def __init__(self, sr=SR, time_length=TIME_LENGTH):
+            super().__init__(name="adsr")
+            self.sr = float(sr)
+            self.time_length = time_length
+            self.total_t = time_length / sr
+
+        def call(self, attack, decay, sustain, release):
+            """
+            Args: 各パラメータ [batch]  0〜1 の正規化値
+            Returns: envelope [batch, time_length]
+            """
+            # 秒数に変換 (指数スケール)
+            max_sec = self.total_t * 0.5
+
+            def to_sec(v):
+                return tf.exp(tf.math.log(0.001 + max_sec) * v) - 0.001 + 0.001
+
+            a = to_sec(attack)  # [batch]
+            d = to_sec(decay)
+            r = to_sec(release)
+            s = sustain  # レベルなのでそのまま
+
+            t = tf.cast(
+                tf.linspace(0.0, self.total_t, self.time_length), tf.float32
+            )  # [time]
+
+            # ブロードキャスト: [batch, time]
+            a = tf.reshape(a, [-1, 1])
+            d = tf.reshape(d, [-1, 1])
+            s = tf.reshape(s, [-1, 1])
+            r = tf.reshape(r, [-1, 1])
+            t = tf.reshape(t, [1, -1])
+
+            a_end = a
+            d_end = a + d
+            r_start = tf.maximum(d_end, self.total_t - r)
+
+            env = tf.where(
+                t < a_end,
+                t / (a_end + 1e-6),
+                tf.where(
+                    t < d_end,
+                    1.0 - (1.0 - s) * (t - a_end) / (d + 1e-6),
+                    tf.where(
+                        t < r_start,
+                        s,
+                        s
+                        * tf.clip_by_value(
+                            1.0 - (t - r_start) / (r + 1e-6), 0.0, 1.0
+                        ),
+                    ),
+                ),
+            )
+            return tf.clip_by_value(env, 0.0, 1.0)  # [batch, time]
+
+    class FilterLayer(tf.keras.layers.Layer):
+        """
+        時変LPF (TFレイヤー版・学習用)
+
+        完全なIIRフィルタはTFグラフモードで実装困難なため、
+        スペクトルマスキングで近似する。
+        """
+
+        def __init__(self, sr=SR, time_length=TIME_LENGTH, n_fft=2048):
+            super().__init__(name="filter")
+            self.sr = float(sr)
+            self.time_length = time_length
+            self.n_fft = n_fft
+
+        def call(self, audio, cutoff, resonance):
+            """
+            Args:
+                audio     : [batch, time_length]
+                cutoff    : [batch]  0〜1
+                resonance : [batch]  0〜1
+            Returns:
+                filtered: [batch, time_length]
+            """
+            # cutoff → Hz → 正規化周波数
+            min_hz = 20.0
+            max_hz = self.sr / 2.0
+            cutoff_hz = min_hz * tf.pow(max_hz / min_hz, cutoff)  # [batch]
+
+            # STFT
+            stft = tf.signal.stft(
+                audio, self.n_fft, self.n_fft // 4, self.n_fft
+            )
+            n_bins = tf.shape(stft)[-1]
+
+            # 周波数軸 [n_bins]
+            freqs = tf.cast(tf.range(n_bins), tf.float32) * (
+                self.sr / self.n_fft
+            )
+
+            # ローパスマスク [batch, 1, n_bins]
+            cutoff_bc = tf.reshape(cutoff_hz, [-1, 1, 1])
+            res_bc = tf.reshape(resonance, [-1, 1, 1])
+
+            # ソフトローパス + レゾナンスピーク
+            mask = tf.sigmoid((cutoff_bc - freqs) / (cutoff_bc * 0.1 + 1.0))
+            # レゾナンスによるカットオフ付近のブースト
+            peak = res_bc * tf.exp(
+                -tf.square((freqs - cutoff_bc) / (cutoff_bc * 0.05 + 1.0))
+            )
+            mask = mask + peak * (1.0 - mask)
+            mask = tf.clip_by_value(mask, 0.0, 2.0)
+
+            # フィルタリング
+            filtered_stft = stft * tf.cast(mask, tf.complex64)
+            filtered_audio = tf.signal.inverse_stft(
+                filtered_stft, self.n_fft, self.n_fft // 4, self.n_fft
+            )
+            # 長さを合わせる
+            filtered_audio = filtered_audio[:, : self.time_length]
+            pad_len = self.time_length - tf.shape(filtered_audio)[1]
+            filtered_audio = tf.pad(filtered_audio, [[0, 0], [0, pad_len]])
+
+            return tf.clip_by_value(filtered_audio, -10.0, 10.0)
