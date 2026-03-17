@@ -57,7 +57,8 @@ class DDSPParams:
     Decoderの出力であり、GUIで直接操作できる単位。
 
     すべてのフィールドは 0〜1 に正規化されている
-    (f0_hz だけ例外でHz値を直接持つ)。
+    (f0_hz だけ例外でHz値を直接持つ、
+     unison_voices だけ例外で整数 1〜7 を直接持つ)。
     """
 
     # Oscillator
@@ -66,21 +67,28 @@ class DDSPParams:
         default_factory=lambda: [1.0] + [0.0] * (NUM_HARMONICS - 1)
     )
 
+    # Unison
+    unison_voices: int = 1  # ボイス数 1〜7 (1=OFF)
+    detune_cents: float = 0.0  # デチューン幅 [セント] 0〜100
+    unison_blend: float = (
+        0.5  # ドライ(1ボイス)とウェット(全ボイス)のブレンド 0〜1
+    )
+
     # Envelope (ADSR)
-    attack: float = 0.1  # 0〜1 → 実時間は adsr_to_seconds() で変換
+    attack: float = 0.1
     decay: float = 0.2
     sustain: float = 0.7
     release: float = 0.3
 
     # Filter
-    cutoff: float = 1.0  # 0〜1 → Hz は cutoff_to_hz() で変換
-    resonance: float = 0.0  # 0〜1
+    cutoff: float = 1.0
+    resonance: float = 0.0
 
     # Noise
-    noise_amount: float = 0.0  # 0〜1
+    noise_amount: float = 0.0
 
     def to_dict(self) -> dict:
-        """マイコン送信用辞書に変換 (numpy → list)"""
+        """マイコン送信用辞書に変換"""
         d = asdict(self)
         if isinstance(d["harmonic_amps"], np.ndarray):
             d["harmonic_amps"] = d["harmonic_amps"].tolist()
@@ -88,11 +96,13 @@ class DDSPParams:
 
     @classmethod
     def from_dict(cls, d: dict) -> "DDSPParams":
-        """辞書から復元"""
         return cls(**d)
 
     def clamp(self) -> "DDSPParams":
         """全パラメータを有効範囲にクランプして返す"""
+        self.unison_voices = int(np.clip(self.unison_voices, 1, 7))
+        self.detune_cents = float(np.clip(self.detune_cents, 0.0, 100.0))
+        self.unison_blend = float(np.clip(self.unison_blend, 0.0, 1.0))
         self.attack = float(np.clip(self.attack, 0.0, 1.0))
         self.decay = float(np.clip(self.decay, 0.0, 1.0))
         self.sustain = float(np.clip(self.sustain, 0.0, 1.0))
@@ -168,6 +178,78 @@ def oscillator_numpy(
     # 合成
     audio = (harmonic_amps[None, :] * np.sin(phase)).sum(axis=1)  # [time]
     return audio.astype(np.float32)
+
+
+# ============================================================
+# モジュール1b: Unison  複数ボイスによるデチューン合成
+# ============================================================
+def unison_numpy(
+    f0_hz: float,
+    harmonic_amps: np.ndarray,
+    unison_voices: int = 1,
+    detune_cents: float = 0.0,
+    unison_blend: float = 0.5,
+    time_length: int = TIME_LENGTH,
+    sr: int = SR,
+) -> np.ndarray:
+    """
+    Unison合成: 複数のボイスをデチューンして加算することで音に厚みを出す。
+
+    【動作原理】
+      unison_voices 本のオシレータを生成し、それぞれの基本周波数を
+      detune_cents の範囲で均等にずらす。
+
+      例: voices=5, detune=20cent の場合
+        ボイス0: f0 × 2^(-20/1200)  ← -20 cent
+        ボイス1: f0 × 2^(-10/1200)  ← -10 cent
+        ボイス2: f0                   ←   0 cent (センター)
+        ボイス3: f0 × 2^(+10/1200)  ← +10 cent
+        ボイス4: f0 × 2^(+20/1200)  ← +20 cent
+
+      unison_blend でドライ(1ボイス)とウェット(全ボイス)をブレンドする。
+      blend=0.0 → 1ボイスのみ (Unison OFF と同等)
+      blend=1.0 → 全ボイスの平均
+
+    Args:
+        f0_hz         : 基本周波数 [Hz]
+        harmonic_amps : 倍音振幅 [NUM_HARMONICS]
+        unison_voices : ボイス数 1〜7 (1のときデチューンなし)
+        detune_cents  : 全ボイスにわたるデチューン幅 [セント] 0〜100
+        unison_blend  : ドライ/ウェットブレンド 0〜1
+        time_length   : 出力サンプル数
+        sr            : サンプリングレート
+
+    Returns:
+        audio: [time_length]  float32
+    """
+    n = max(1, int(unison_voices))
+
+    # ボイスが1本またはデチューンがゼロの場合は通常合成
+    if n == 1 or detune_cents < 0.001:
+        return oscillator_numpy(f0_hz, harmonic_amps, time_length, sr)
+
+    # ドライ信号 (センターボイス単体)
+    dry = oscillator_numpy(f0_hz, harmonic_amps, time_length, sr)
+
+    # 各ボイスのデチューン量 [セント] を均等に配置
+    if n == 1:
+        offsets_cents = [0.0]
+    else:
+        offsets_cents = np.linspace(
+            -detune_cents / 2.0, detune_cents / 2.0, n
+        ).tolist()
+
+    # ウェット信号: 全ボイスを合成して平均
+    wet = np.zeros(time_length, dtype=np.float32)
+    for cents in offsets_cents:
+        # セント → 周波数倍率 (1セント = 2^(1/1200))
+        detuned_f0 = f0_hz * (2.0 ** (cents / 1200.0))
+        wet += oscillator_numpy(detuned_f0, harmonic_amps, time_length, sr)
+    wet /= n  # 平均化 (ボイスを増やしても音量が変わらないように)
+
+    # ドライ/ウェットブレンド
+    blend = float(np.clip(unison_blend, 0.0, 1.0))
+    return ((1.0 - blend) * dry + blend * wet).astype(np.float32)
 
 
 # ============================================================
@@ -380,7 +462,7 @@ def synthesize_numpy(
     DDSPParams から音声波形を合成する。
 
     処理フロー:
-      1. Oscillator  → 倍音波形
+      1. Oscillator + Unison → 倍音波形 (複数ボイスのデチューン合成)
       2. ADSR        → 振幅エンベロープ
       3. Filter      → カットオフ / レゾナンス
       4. Noise       → ノイズ混合
@@ -395,19 +477,16 @@ def synthesize_numpy(
 
     Returns:
         audio: float32 [time_length]  (-1〜1)
-
-    使用例 (DSPマイコン側):
-        from dsp import DDSPParams, synthesize_numpy
-        params = DDSPParams.from_dict(uart.receive())
-        audio  = synthesize_numpy(params, fast_filter=False)
-        play(audio)
     """
     params = params.clamp()
 
-    # --- 1. Oscillator ---
-    audio = oscillator_numpy(
+    # --- 1. Oscillator + Unison ---
+    audio = unison_numpy(
         f0_hz=params.f0_hz,
         harmonic_amps=np.array(params.harmonic_amps, dtype=np.float32),
+        unison_voices=params.unison_voices,
+        detune_cents=params.detune_cents,
+        unison_blend=params.unison_blend,
         time_length=time_length,
         sr=sr,
     )

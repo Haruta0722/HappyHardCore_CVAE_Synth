@@ -89,6 +89,9 @@ TIMBRE_NAMES = ["screech", "acid", "pluck"]
 # DDSPパラメータスライダーの定義 (Oscillator は HarmonicEditor で別途表示)
 # (キー, 表示ラベル, 色, グループ)
 DDSP_SLIDERS = [
+    # Unison (unison_voices は専用ステッパーで別途表示)
+    ("detune_cents", "DETUNE", ACCENT, "UNI"),  # 0〜100 cent
+    ("unison_blend", "BLEND", ACCENT, "UNI"),  # ドライ/ウェット
     # ADSR
     ("attack", "ATTACK", ACCENT3, "ENV"),
     ("decay", "DECAY", ACCENT3, "ENV"),
@@ -100,6 +103,11 @@ DDSP_SLIDERS = [
     # Noise
     ("noise_amount", "NOISE", ACCENT2, "NOI"),
 ]
+
+# detune_cents は 0〜100 の実値スケール (スライダーの 0〜1 → 0〜100 に変換)
+SLIDER_SCALE = {
+    "detune_cents": 100.0,  # スライダー値 × 100 = cents
+}
 
 
 # ══════════════════════════════════════════════════════════════
@@ -126,6 +134,91 @@ def weights_to_tensor(weights):
         else np.ones(TIMBRE_VOCAB, dtype=np.float32) / TIMBRE_VOCAB
     )
     return tf.constant(vals[None, :], dtype=tf.float32)
+
+
+# ══════════════════════════════════════════════════════════════
+#  ボイス数ステッパー (1〜7)
+# ══════════════════════════════════════════════════════════════
+class VoiceStepper(tk.Frame):
+    """
+    ◀ 1 ▶ のような左右ボタンでボイス数 (1〜7) を選択するウィジェット。
+    奇数のみ (1,3,5,7) を選択できる。
+    偶数にするとセンターボイスが存在しなくなりピッチが不安定になるため。
+    """
+
+    VOICES = [1, 2, 3, 4, 5, 6, 7]
+
+    def __init__(self, parent, command=None, **kw):
+        super().__init__(parent, bg=PANEL3, **kw)
+        self._idx = 0  # VOICES のインデックス
+        self.command = command
+
+        tk.Button(
+            self,
+            text="◀",
+            bg=PANEL3,
+            fg=DIM,
+            relief="flat",
+            font=("Courier", 10),
+            width=2,
+            cursor="hand2",
+            activebackground="#222",
+            activeforeground=ACCENT,
+            command=self._dec,
+        ).pack(side="left")
+
+        self._label = tk.Label(
+            self,
+            text="1",
+            bg=PANEL3,
+            fg=ACCENT,
+            font=("Courier", 14, "bold"),
+            width=2,
+        )
+        self._label.pack(side="left", padx=4)
+
+        tk.Button(
+            self,
+            text="▶",
+            bg=PANEL3,
+            fg=DIM,
+            relief="flat",
+            font=("Courier", 10),
+            width=2,
+            cursor="hand2",
+            activebackground="#222",
+            activeforeground=ACCENT,
+            command=self._inc,
+        ).pack(side="left")
+
+        tk.Label(
+            self, text="VOICES", bg=PANEL3, fg=DIM, font=("Courier", 7)
+        ).pack(side="left", padx=6)
+
+    def get(self) -> int:
+        return self.VOICES[self._idx]
+
+    def set(self, v: int):
+        v = int(np.clip(v, 1, 7))
+        # 一番近いVOICESのインデックスに合わせる
+        self._idx = min(
+            range(len(self.VOICES)), key=lambda i: abs(self.VOICES[i] - v)
+        )
+        self._label.config(text=str(self.VOICES[self._idx]))
+
+    def _dec(self):
+        if self._idx > 0:
+            self._idx -= 1
+            self._label.config(text=str(self.VOICES[self._idx]))
+            if self.command:
+                self.command(self.VOICES[self._idx])
+
+    def _inc(self):
+        if self._idx < len(self.VOICES) - 1:
+            self._idx += 1
+            self._label.config(text=str(self.VOICES[self._idx]))
+            if self.command:
+                self.command(self.VOICES[self._idx])
 
 
 # ══════════════════════════════════════════════════════════════
@@ -848,7 +941,7 @@ class SynthApp:
                 gframe = tk.Frame(frame, bg=PANEL3, padx=6, pady=4)
                 gframe.pack(fill="x", padx=8, pady=(6, 0))
                 group_labels = {
-                    "OSC": "▶ OSCILLATOR",
+                    "UNI": "▶ UNISON",
                     "ENV": "▶ ENVELOPE (ADSR)",
                     "FLT": "▶ FILTER",
                     "NOI": "▶ NOISE",
@@ -860,6 +953,16 @@ class SynthApp:
                     fg=DIM,
                     font=("Courier", 7),
                 ).pack(anchor="w")
+
+                # Unisonグループの先頭にVoiceStepperを配置
+                if group == "UNI":
+                    stepper_row = tk.Frame(frame, bg=PANEL2, padx=8)
+                    stepper_row.pack(fill="x", pady=2)
+                    self._voice_stepper = VoiceStepper(
+                        stepper_row,
+                        command=self._on_voice_change,
+                    )
+                    self._voice_stepper.pack(side="left")
 
             row = tk.Frame(frame, bg=PANEL2, padx=8)
             row.pack(fill="x", pady=2)
@@ -996,11 +1099,19 @@ class SynthApp:
             return
         self._ddsp.harmonic_amps = amps
 
+    def _on_voice_change(self, voices: int):
+        """VoiceStepperでボイス数が変わったとき DDSPParams を更新"""
+        if self._ddsp is None:
+            return
+        self._ddsp.unison_voices = voices
+
     def _on_ddsp_slider(self, key, value):
         """スライダーが動いたとき DDSPParams を更新"""
         if self._ddsp is None:
             return
-        setattr(self._ddsp, key, value)
+        # スケール変換が必要なパラメータを変換
+        scale = SLIDER_SCALE.get(key, 1.0)
+        setattr(self._ddsp, key, float(value) * scale)
 
     def _on_note_and_generate(self, midi):
         self._midi = midi
@@ -1033,15 +1144,21 @@ class SynthApp:
             self._bar_texts[name].config(text=f"{norm[i]:.2f}")
 
     def _update_ddsp_sliders(self, ddsp):
-        """DDSPParams の値をスライダーと倍音エディタに反映"""
+        """DDSPParams の値をスライダー・倍音エディタ・VoiceStepperに反映"""
         if not HAS_MODEL:
             return
 
         # 倍音エディタ
         self._harm_editor.set_amps(ddsp.harmonic_amps)
 
-        # ADSR / Filter / Noise スライダー
+        # VoiceStepper
+        self._voice_stepper.set(ddsp.unison_voices)
+
+        # スライダー (スケール逆変換してから 0〜1 に正規化)
         mapping = {
+            "detune_cents": ddsp.detune_cents
+            / SLIDER_SCALE.get("detune_cents", 1.0),
+            "unison_blend": ddsp.unison_blend,
             "attack": ddsp.attack,
             "decay": ddsp.decay,
             "sustain": ddsp.sustain,
@@ -1123,8 +1240,9 @@ class SynthApp:
                 text="先にGENERATEしてください", fg=ACCENT2
             )
             return
-        # 倍音エディタの最新値を反映
+        # 各ウィジェットの最新値を反映
         self._ddsp.harmonic_amps = self._harm_editor.get_amps()
+        self._ddsp.unison_voices = self._voice_stepper.get()
         self._ddsp.f0_hz = float(midi_to_freq(self._midi))
         waveform = synthesize_numpy(
             self._ddsp, sr=SR, time_length=TIME_LENGTH, fast_filter=True
