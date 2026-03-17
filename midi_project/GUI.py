@@ -86,16 +86,9 @@ KEY_ACT = ACCENT
 KNOB_COLORS = {"screech": ACCENT2, "acid": ACID_COL, "pluck": ACCENT3}
 TIMBRE_NAMES = ["screech", "acid", "pluck"]
 
-# DDSPパラメータスライダーの定義
+# DDSPパラメータスライダーの定義 (Oscillator は HarmonicEditor で別途表示)
 # (キー, 表示ラベル, 色, グループ)
 DDSP_SLIDERS = [
-    # Oscillator
-    (
-        "harm_brightness",
-        "BRIGHTNESS",
-        ACCENT,
-        "OSC",
-    ),  # 高倍音の強さ (harmonic_amps から計算)
     # ADSR
     ("attack", "ATTACK", ACCENT3, "ENV"),
     ("decay", "DECAY", ACCENT3, "ENV"),
@@ -135,23 +128,198 @@ def weights_to_tensor(weights):
     return tf.constant(vals[None, :], dtype=tf.float32)
 
 
-def brightness_from_amps(harmonic_amps):
-    """harmonic_amps → 高倍音の重み平均 (0〜1) をブライトネスとして返す"""
-    amps = np.array(harmonic_amps, dtype=np.float32)
-    n = len(amps)
-    if n == 0 or amps.sum() < 1e-8:
-        return 0.5
-    weights = np.linspace(0.0, 1.0, n)
-    return float(np.dot(amps / (amps.sum() + 1e-8), weights))
+# ══════════════════════════════════════════════════════════════
+#  倍音エディタウィジェット
+# ══════════════════════════════════════════════════════════════
+class HarmonicEditor(tk.Canvas):
+    """
+    倍音スペクトルを棒グラフで表示し、各棒を直接ドラッグ操作できるウィジェット。
 
+    ・各バーは倍音1〜NUM_HARMONICS の振幅 (0.0〜1.0) を表す
+    ・クリックまたはドラッグで振幅を変更
+    ・バーの色は低次倍音=暖色 (赤)〜高次倍音=寒色 (青) のグラデーション
+    ・VAE推論値を set_amps() で外部から更新できる
+    ・on_change コールバックで変更を通知
+    """
 
-def brightness_to_amps(brightness, n=NUM_HARMONICS):
-    """ブライトネス値 → softmax的なharmonic_amps"""
-    weights = np.linspace(0.0, 1.0, n)
-    # brightがゼロなら基音のみ、1なら高次倍音が強い
-    logits = (weights - 0.5) * brightness * 10.0
-    amps = np.exp(logits - logits.max())
-    return (amps / amps.sum()).tolist()
+    BAR_GAP = 2  # バー間の隙間 [px]
+
+    def __init__(
+        self,
+        parent,
+        num_harmonics=NUM_HARMONICS,
+        width=380,
+        height=120,
+        on_change=None,
+        **kw,
+    ):
+        super().__init__(
+            parent,
+            width=width,
+            height=height,
+            bg="#0a0a0a",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+            **kw,
+        )
+        self.num_harmonics = num_harmonics
+        self.on_change = on_change
+        self._amps = [1.0 / num_harmonics] * num_harmonics  # 初期値: 均等
+        self._amps[0] = 0.5  # 基音をやや強く
+
+        # バーの色: 1倍音=赤(FF4400) → 32倍音=青(0088FF) のグラデーション
+        self._bar_colors = self._make_gradient(num_harmonics)
+
+        self.bind("<Configure>", self._on_configure)
+        self.bind("<ButtonPress-1>", self._on_press)
+        self.bind("<B1-Motion>", self._on_drag)
+        self.bind("<ButtonRelease-1>", self._on_release)
+        self._drag_active = False
+        self._redraw()
+
+    @staticmethod
+    def _make_gradient(n):
+        """1倍音=赤 → n倍音=青 のグラデーションカラーリスト"""
+        colors = []
+        for i in range(n):
+            t = i / max(n - 1, 1)  # 0.0 〜 1.0
+            r = int(255 * (1.0 - t))
+            g = int(120 * math.sin(math.pi * t))
+            b = int(255 * t)
+            colors.append(f"#{r:02x}{g:02x}{b:02x}")
+        return colors
+
+    # ── 外部API ───────────────────────────────────────────────────────
+    def get_amps(self):
+        """現在の振幅リスト [NUM_HARMONICS] を返す"""
+        return list(self._amps)
+
+    def set_amps(self, amps):
+        """外部から振幅を設定して再描画する (コールバックは発火しない)"""
+        n = min(len(amps), self.num_harmonics)
+        self._amps[:n] = [float(np.clip(v, 0.0, 1.0)) for v in amps[:n]]
+        self._redraw()
+
+    # ── 描画 ─────────────────────────────────────────────────────────
+    def _on_configure(self, _):
+        self._redraw()
+
+    def _redraw(self):
+        self.delete("all")
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 4 or h < 4:
+            return
+
+        n = self.num_harmonics
+        bar_w = max(1, (w - self.BAR_GAP * (n + 1)) / n)
+        baseline = h - 18  # 下部にラベル用スペース
+
+        for i in range(n):
+            amp = float(np.clip(self._amps[i], 0.0, 1.0))
+            x0 = self.BAR_GAP + i * (bar_w + self.BAR_GAP)
+            bar_h = max(2, amp * (baseline - 4))
+            y0 = baseline - bar_h
+            x1 = x0 + bar_w
+
+            # バー本体
+            self.create_rectangle(
+                x0,
+                y0,
+                x1,
+                baseline,
+                fill=self._bar_colors[i],
+                outline="",
+                tags=f"bar{i}",
+            )
+
+            # 選択時のハイライト枠
+            self.create_rectangle(
+                x0,
+                y0,
+                x1,
+                baseline,
+                fill="",
+                outline="",
+                width=1,
+                tags=f"outline{i}",
+            )
+
+            # 倍音番号ラベル (1, 2, 4, 8, 16, 32 のみ表示)
+            harmonic_num = i + 1
+            if harmonic_num in (1, 2, 4, 8, 16, 32) or n <= 16:
+                self.create_text(
+                    (x0 + x1) / 2,
+                    h - 8,
+                    text=str(harmonic_num),
+                    fill=DIM,
+                    font=("Courier", 6),
+                    anchor="center",
+                )
+
+        # ベースライン
+        self.create_line(0, baseline, w, baseline, fill=BORDER, width=1)
+
+        # ウィジェットタイトル
+        self.create_text(
+            4,
+            4,
+            text="HARMONICS  (drag to edit)",
+            fill=DIM,
+            font=("Courier", 7),
+            anchor="nw",
+        )
+
+    # ── マウス操作 ───────────────────────────────────────────────────
+    def _xy_to_harmonic_and_amp(self, x, y):
+        """マウス座標 → (倍音インデックス, 振幅値) を返す"""
+        w = self.winfo_width()
+        h = self.winfo_height()
+        if w < 4 or h < 4:
+            return None, None
+
+        n = self.num_harmonics
+        bar_w = max(1, (w - self.BAR_GAP * (n + 1)) / n)
+        baseline = h - 18
+
+        # どのバーか
+        idx = int((x - self.BAR_GAP) / (bar_w + self.BAR_GAP))
+        if idx < 0 or idx >= n:
+            return None, None
+
+        # y座標 → 振幅 (上端=1.0, ベースライン=0.0)
+        amp = 1.0 - (y - 4) / (baseline - 4)
+        amp = float(np.clip(amp, 0.0, 1.0))
+        return idx, amp
+
+    def _set_amp_at(self, x, y):
+        idx, amp = self._xy_to_harmonic_and_amp(x, y)
+        if idx is None:
+            return
+        self._amps[idx] = amp
+        self._redraw()
+        # ハイライト
+        w = self.winfo_width()
+        n = self.num_harmonics
+        bar_w = max(1, (w - self.BAR_GAP * (n + 1)) / n)
+        x0 = self.BAR_GAP + idx * (bar_w + self.BAR_GAP)
+        h = self.winfo_height()
+        baseline = h - 18
+        self.itemconfig(f"outline{idx}", outline=ACCENT, width=1)
+        if self.on_change:
+            self.on_change(list(self._amps))
+
+    def _on_press(self, e):
+        self._drag_active = True
+        self._set_amp_at(e.x, e.y)
+
+    def _on_drag(self, e):
+        if self._drag_active:
+            self._set_amp_at(e.x, e.y)
+
+    def _on_release(self, _):
+        self._drag_active = False
+        self._redraw()
 
 
 # ══════════════════════════════════════════════════════════════
@@ -641,7 +809,7 @@ class SynthApp:
             lambda e: canvas.configure(scrollregion=canvas.bbox("all")),
         )
 
-        # ── DDSPパラメータスライダー ────────────────────────────────
+        # ── DDSPパラメータ ─────────────────────────────────────────────
         tk.Label(
             frame,
             text="DDSP PARAMETERS",
@@ -653,6 +821,26 @@ class SynthApp:
         ).pack(anchor="w")
         tk.Frame(frame, bg=ACCENT, height=1).pack(fill="x", padx=8)
 
+        # ── Oscillator: 倍音エディタ ────────────────────────────────
+        osc_frame = tk.Frame(frame, bg=PANEL3, padx=6, pady=6)
+        osc_frame.pack(fill="x", padx=8, pady=(6, 0))
+        tk.Label(
+            osc_frame,
+            text="▶ OSCILLATOR  (1〜32倍音)",
+            bg=PANEL3,
+            fg=DIM,
+            font=("Courier", 7),
+        ).pack(anchor="w", pady=(0, 4))
+        self._harm_editor = HarmonicEditor(
+            osc_frame,
+            num_harmonics=NUM_HARMONICS,
+            width=360,
+            height=130,
+            on_change=self._on_harmonic_change,
+        )
+        self._harm_editor.pack(fill="x")
+
+        # ── ADSR / Filter / Noise スライダー ────────────────────────
         current_group = [None]
         for key, label, color, group in DDSP_SLIDERS:
             if group != current_group[0]:
@@ -802,14 +990,17 @@ class SynthApp:
         self._params[name] = value
         self._update_blend_bars()
 
-    def _on_ddsp_slider(self, key, value):
-        """スライダーが動いたとき DDSPParams を更新 (RE-SYNTHまで音は変わらない)"""
+    def _on_harmonic_change(self, amps):
+        """倍音エディタで値が変わったとき DDSPParams を更新"""
         if self._ddsp is None:
             return
-        if key == "harm_brightness":
-            self._ddsp.harmonic_amps = brightness_to_amps(value)
-        else:
-            setattr(self._ddsp, key, value)
+        self._ddsp.harmonic_amps = amps
+
+    def _on_ddsp_slider(self, key, value):
+        """スライダーが動いたとき DDSPParams を更新"""
+        if self._ddsp is None:
+            return
+        setattr(self._ddsp, key, value)
 
     def _on_note_and_generate(self, midi):
         self._midi = midi
@@ -841,12 +1032,16 @@ class SynthApp:
                 cv.coords(self._bar_fills[name], 0, 0, int(w * norm[i]), 5)
             self._bar_texts[name].config(text=f"{norm[i]:.2f}")
 
-    def _update_ddsp_sliders(self, ddsp: "DDSPParams"):
-        """DDSPParams の値をスライダーに反映"""
+    def _update_ddsp_sliders(self, ddsp):
+        """DDSPParams の値をスライダーと倍音エディタに反映"""
         if not HAS_MODEL:
             return
+
+        # 倍音エディタ
+        self._harm_editor.set_amps(ddsp.harmonic_amps)
+
+        # ADSR / Filter / Noise スライダー
         mapping = {
-            "harm_brightness": brightness_from_amps(ddsp.harmonic_amps),
             "attack": ddsp.attack,
             "decay": ddsp.decay,
             "sustain": ddsp.sustain,
@@ -922,12 +1117,14 @@ class SynthApp:
         return waveform.astype(np.float32), ddsp
 
     def _resynth(self):
-        """スライダーで手動設定したパラメータで再合成"""
+        """スライダーと倍音エディタで設定したパラメータで再合成"""
         if self._ddsp is None:
             self._status_label.config(
                 text="先にGENERATEしてください", fg=ACCENT2
             )
             return
+        # 倍音エディタの最新値を反映
+        self._ddsp.harmonic_amps = self._harm_editor.get_amps()
         self._ddsp.f0_hz = float(midi_to_freq(self._midi))
         waveform = synthesize_numpy(
             self._ddsp, sr=SR, time_length=TIME_LENGTH, fast_filter=True
