@@ -126,13 +126,16 @@ def pitch_norm(m):
 
 
 def weights_to_tensor(weights):
+    """
+    ノブの値をそのまま timbre_weights テンソルに変換する。
+    正規化はしない。全部0の場合は screech=1.0 をデフォルトにする。
+    """
     vals = np.array([weights[n] for n in TIMBRE_NAMES], dtype=np.float32)
-    total = vals.sum()
-    vals = (
-        vals / total
-        if total > 1e-6
-        else np.ones(TIMBRE_VOCAB, dtype=np.float32) / TIMBRE_VOCAB
-    )
+    # 全部ゼロのときだけデフォルト (screech単体) にフォールバック
+    if vals.sum() < 1e-6:
+        vals = np.array([1.0, 0.0, 0.0], dtype=np.float32)
+    # blend() 内部で matmul するので正規化は不要
+    # (重みの合計が1でなくてもEmbeddingの重み付き平均として機能する)
     return tf.constant(vals[None, :], dtype=tf.float32)
 
 
