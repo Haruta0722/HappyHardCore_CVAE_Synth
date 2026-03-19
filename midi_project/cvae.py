@@ -43,6 +43,66 @@ from dsp import (
 
 
 # ============================================================
+# 音色ごとの倍音プロファイルテンプレート
+# ============================================================
+def _make_harmonic_templates(num_harmonics: int) -> tf.Tensor:
+    """
+    各音色カテゴリの「理想的な倍音プロファイル」を定義する。
+
+    Screech : 高次倍音が強い (鋸歯状波に近い)
+    Acid    : 中域倍音にピーク (TB-303的なフィルタースイープ音)
+    Pluck   : 基音が強く指数的に減衰 (弦楽器の撥音)
+
+    これをDecoderが出力する harmonic_amps の正解値として使い、
+    音色カテゴリごとに異なる倍音分布を学習させる。
+
+    Returns:
+        templates: [TIMBRE_VOCAB, num_harmonics]  float32
+    """
+    H = num_harmonics
+    idx = np.arange(1, H + 1, dtype=np.float32)
+
+    # Screech (id=0): 奇数倍音強調 + 高域を保持 (鋸歯状 + クリップ)
+    screech = 1.0 / idx  # 1/n ロールオフ
+    screech[1::2] *= 0.3  # 偶数倍音を抑制
+    screech = screech / screech.max()
+
+    # Acid (id=1): 基音〜中域にエネルギー集中 (低次〜中次にピーク)
+    peak = H * 0.25  # 全倍音数の1/4あたりにピーク
+    acid = np.exp(-0.5 * ((idx - peak) / (H * 0.15)) ** 2)
+    acid = acid / acid.max()
+
+    # Pluck (id=2): 基音が最強、指数減衰
+    pluck = np.exp(-idx * 0.18)
+    pluck = pluck / pluck.max()
+
+    templates = np.stack([screech, acid, pluck], axis=0).astype(np.float32)
+    return tf.constant(templates, dtype=tf.float32)
+
+
+# グローバルにテンプレートを作成
+HARMONIC_TEMPLATES = _make_harmonic_templates(NUM_HARMONICS)
+
+
+def compute_harmonic_timbre_loss(
+    harmonic_amps: tf.Tensor,  # [batch, NUM_HARMONICS]
+    timbre_id: tf.Tensor,  # [batch]  int32
+) -> tf.Tensor:
+    """
+    Decoderが出力した harmonic_amps を、
+    音色カテゴリに対応するテンプレートに近づける補助損失。
+
+    timbre_id から対応するテンプレートを引いて MSE を計算する。
+    これにより「Screech のときは高次倍音が強い」という
+    音色固有の倍音構造を学習させる。
+    """
+    # timbre_id → テンプレート  [batch, NUM_HARMONICS]
+    targets = tf.gather(HARMONIC_TEMPLATES, timbre_id)
+    loss = tf.reduce_mean(tf.square(harmonic_amps - targets))
+    return loss
+
+
+# ============================================================
 # 損失関数ユーティリティ
 # ============================================================
 def compute_spectral_flux_loss(
@@ -226,9 +286,11 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         feat = self.shared_mlp(x)  # [batch, 256]
 
         # 各パラメータを独立ヘッドで推論
-        harmonic_amps = tf.nn.softmax(
-            self.harm_head(feat), axis=-1
-        )  # [batch, H]
+        # softmax → sigmoid に変更:
+        #   softmax は合計1の制約があり「全体の倍音量」を変えられない。
+        #   sigmoid にすると各倍音が独立に 0〜1 を取れ、
+        #   音色ごとに「倍音の豊かさ」の違いを表現できる。
+        harmonic_amps = tf.sigmoid(self.harm_head(feat))  # [batch, H]
         attack = tf.squeeze(self.attack_head(feat), axis=-1)  # [batch]
         decay = tf.squeeze(self.decay_head(feat), axis=-1)
         sustain = tf.squeeze(self.sustain_head(feat), axis=-1)
@@ -493,6 +555,14 @@ class TimeWiseCVAE(tf.keras.Model):
             hf_l = s(compute_high_freq_emphasis_loss(x_target, x_hat_sq))
             flux_l = s(compute_spectral_flux_loss(x_target, x_hat_sq), 0.1)
 
+            # 倍音プロファイル補助損失:
+            # timbre_id に対応するテンプレートと harmonic_amps の MSE を計算。
+            # ブレンドで生成された場合 (timbre_idが不確か) でも学習データには
+            # 常に単一カテゴリのIDが入っているので安全に使える。
+            harm_timbre_l = s(
+                compute_harmonic_timbre_loss(p["harmonic_amps"], timbre_id)
+            )
+
             kl_per_dim = -0.5 * (
                 1.0 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
             )
@@ -513,6 +583,7 @@ class TimeWiseCVAE(tf.keras.Model):
                 + mel_l * 4.0
                 + hf_l * 2.0
                 + flux_l * 2.0
+                + harm_timbre_l * 3.0  # 倍音プロファイル補助損失
                 + kl * kl_w
             )
             loss = s(loss, 1000.0)
@@ -551,6 +622,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "high_freq": hf_l,
             "spectral_flux": flux_l,
+            "harm_timbre": harm_timbre_l,
             "kl": kl,
             "kl_weight": kl_w,
             "z_std_ema": self.z_std_ema,
@@ -585,6 +657,9 @@ class TimeWiseCVAE(tf.keras.Model):
         mel_l = s(mel_l)
         hf_l = s(compute_high_freq_emphasis_loss(x_target, x_hat_sq))
         flux_l = s(compute_spectral_flux_loss(x_target, x_hat_sq), 0.1)
+        harm_timbre_l = s(
+            compute_harmonic_timbre_loss(p["harmonic_amps"], timbre_id)
+        )
 
         kl_per_dim = -0.5 * (
             1.0 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
@@ -604,6 +679,7 @@ class TimeWiseCVAE(tf.keras.Model):
             + mel_l * 4.0
             + hf_l * 2.0
             + flux_l * 2.0
+            + harm_timbre_l * 3.0
             + kl * kl_w
         )
         loss = s(loss, 1000.0)
@@ -615,6 +691,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "high_freq": hf_l,
             "spectral_flux": flux_l,
+            "harm_timbre": harm_timbre_l,
             "kl": kl,
             "kl_weight": kl_w,
         }
