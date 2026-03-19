@@ -27,7 +27,7 @@ import numpy as np
 import soundfile as sf
 import tensorflow as tf
 
-from config import TIME_LENGTH, TIMBRE_VOCAB
+from config import TIME_LENGTH
 from cvae import TimeWiseCVAE
 
 # ============================================================
@@ -260,6 +260,7 @@ class PrintMetricsCallback(tf.keras.callbacks.Callback):
             f"kl_w={logs.get('kl_weight', 0):.5f}",
             f"stft={logs.get('stft', 0):.4f}",
             f"mel={logs.get('mel', 0):.4f}",
+            f"harm={logs.get('harm_timbre', 0):.4f}",
             f"z_std={logs.get('z_std_ema', 0):.3f}",
             f"g_norm={logs.get('grad_norm', 0):.3f}",
         ]
@@ -385,7 +386,7 @@ def build_and_train(cfg: dict):
     out_dir.mkdir(parents=True, exist_ok=True)
     final_path = out_dir / "weights_final.weights.h5"
     model.save_weights(str(final_path))
-    print(f"\n=== 学習完了 ===")
+    print("\n=== 学習完了 ===")
     print(f"  最終重み  : {final_path}")
     print(f"  ベスト重み: {ckpt_dir / 'best_weights.weights.h5'}")
 
