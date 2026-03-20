@@ -121,22 +121,23 @@ def adsr_to_seconds(
     value: float, param: str, total: float = TIME_LENGTH / SR
 ) -> float:
     """
-    正規化ADSR値 [0,1] → 秒数
+    正規化値 [0,1] → 秒数 (対数スケール)
 
-    attack, decay, release: 0〜total*0.5 秒
-    sustain: 0〜1 (レベルなので変換不要)
+    value=0.0 → 最短時間
+    value=1.0 → 最長時間 (total の半分)
+
+    対数スケールにすることで短い時間側の解像度を高める。
     """
     if param == "sustain":
-        return value
-    max_sec = total * 0.5
-    # 指数スケールで短い時間に解像度を集中させる
-    return float(np.exp(np.log(0.001 + max_sec) * value) - 0.001 + 0.001)
+        return float(value)  # sustain はレベルなのでそのまま返す
+    min_sec = 0.005  # 最短 5ms
+    max_sec = total * 0.5  # 最長 total の半分 (1.3s → 0.65s)
+    # 対数補間: value=0 → min_sec, value=1 → max_sec
+    return float(min_sec * (max_sec / min_sec) ** float(value))
 
 
 def cutoff_to_hz(cutoff: float, sr: int = SR) -> float:
-    """
-    正規化カットオフ [0,1] → Hz (対数スケール: 20Hz〜SR/2)
-    """
+    """正規化カットオフ [0,1] → Hz (対数スケール: 20Hz〜SR/2)"""
     min_hz = 20.0
     max_hz = sr / 2.0
     return float(min_hz * (max_hz / min_hz) ** cutoff)
@@ -154,8 +155,9 @@ def oscillator_numpy(
     """
     加算合成で倍音波形を生成する。
 
-    累積位相を使うことで位相連続性を保証。
-    harmonic_amps は各倍音の相対振幅 (softmaxで合計1が望ましい)。
+    harmonic_amps の値が小さい倍音はほぼ無音になるよう、
+    振幅に対して二乗を適用して感度を高める。
+    これにより GUIで倍音を 0 に近づけると実際に無音になる。
 
     Returns:
         audio: [time_length]  float32
@@ -166,14 +168,15 @@ def oscillator_numpy(
 
     # 各倍音の周波数 [num_harmonics]
     harm_nums = np.arange(1, num_harmonics + 1, dtype=np.float32)
-    harm_freqs = f0_hz * harm_nums  # [H]
+    harm_freqs = f0_hz * harm_nums
     harm_freqs = np.clip(harm_freqs, 0.0, sr / 2.0)
 
-    # サンプルごとの位相増分 [time, H]
-    delta_phase = 2.0 * np.pi * harm_freqs[None, :] / sr  # [1, H] broadcast
-    phase = np.cumsum(
-        np.tile(delta_phase, (time_length, 1)), axis=0
-    )  # [time, H]
+    # サンプルごとの位相増分 → 累積位相 [time, H]
+    delta_phase = 2.0 * np.pi * harm_freqs[None, :] / sr
+    phase = np.cumsum(np.tile(delta_phase, (time_length, 1)), axis=0)
+
+    # 0.05 未満の倍音は無音とみなす
+    harmonic_amps = np.where(harmonic_amps < 0.05, 0.0, harmonic_amps)
 
     # 合成
     audio = (harmonic_amps[None, :] * np.sin(phase)).sum(axis=1)  # [time]
@@ -195,59 +198,26 @@ def unison_numpy(
     """
     Unison合成: 複数のボイスをデチューンして加算することで音に厚みを出す。
 
-    【動作原理】
-      unison_voices 本のオシレータを生成し、それぞれの基本周波数を
-      detune_cents の範囲で均等にずらす。
-
-      例: voices=5, detune=20cent の場合
-        ボイス0: f0 × 2^(-20/1200)  ← -20 cent
-        ボイス1: f0 × 2^(-10/1200)  ← -10 cent
-        ボイス2: f0                   ←   0 cent (センター)
-        ボイス3: f0 × 2^(+10/1200)  ← +10 cent
-        ボイス4: f0 × 2^(+20/1200)  ← +20 cent
-
-      unison_blend でドライ(1ボイス)とウェット(全ボイス)をブレンドする。
-      blend=0.0 → 1ボイスのみ (Unison OFF と同等)
-      blend=1.0 → 全ボイスの平均
-
-    Args:
-        f0_hz         : 基本周波数 [Hz]
-        harmonic_amps : 倍音振幅 [NUM_HARMONICS]
-        unison_voices : ボイス数 1〜7 (1のときデチューンなし)
-        detune_cents  : 全ボイスにわたるデチューン幅 [セント] 0〜100
-        unison_blend  : ドライ/ウェットブレンド 0〜1
-        time_length   : 出力サンプル数
-        sr            : サンプリングレート
-
-    Returns:
-        audio: [time_length]  float32
+    unison_blend でドライ(1ボイス)とウェット(全ボイス)をブレンドする。
+    blend=0.0 → 1ボイスのみ、blend=1.0 → 全ボイスの平均
     """
     n = max(1, int(unison_voices))
 
-    # ボイスが1本またはデチューンがゼロの場合は通常合成
     if n == 1 or detune_cents < 0.001:
         return oscillator_numpy(f0_hz, harmonic_amps, time_length, sr)
 
-    # ドライ信号 (センターボイス単体)
     dry = oscillator_numpy(f0_hz, harmonic_amps, time_length, sr)
 
-    # 各ボイスのデチューン量 [セント] を均等に配置
-    if n == 1:
-        offsets_cents = [0.0]
-    else:
-        offsets_cents = np.linspace(
-            -detune_cents / 2.0, detune_cents / 2.0, n
-        ).tolist()
+    offsets_cents = np.linspace(
+        -detune_cents / 2.0, detune_cents / 2.0, n
+    ).tolist()
 
-    # ウェット信号: 全ボイスを合成して平均
     wet = np.zeros(time_length, dtype=np.float32)
     for cents in offsets_cents:
-        # セント → 周波数倍率 (1セント = 2^(1/1200))
         detuned_f0 = f0_hz * (2.0 ** (cents / 1200.0))
         wet += oscillator_numpy(detuned_f0, harmonic_amps, time_length, sr)
-    wet /= n  # 平均化 (ボイスを増やしても音量が変わらないように)
+    wet /= n
 
-    # ドライ/ウェットブレンド
     blend = float(np.clip(unison_blend, 0.0, 1.0))
     return ((1.0 - blend) * dry + blend * wet).astype(np.float32)
 
@@ -264,18 +234,15 @@ def adsr_envelope_numpy(
     sr: int = SR,
 ) -> np.ndarray:
     """
-    ADSRエンベロープを生成する。
+    ADSRエンベロープを生成する (ループ版・マイコン向け)
 
     Args:
         attack   : アタック時間 [秒]
         decay    : ディケイ時間 [秒]
         sustain  : サステインレベル [0〜1]
-        release  : リリース時間 [秒]  (音声末尾からリリース開始)
+        release  : リリース時間 [秒]
         time_length: サンプル数
         sr       : サンプリングレート
-
-    Returns:
-        envelope: [time_length]  float32  (0〜1)
     """
     t = np.linspace(
         0.0, time_length / sr, time_length, endpoint=False, dtype=np.float32
@@ -283,22 +250,20 @@ def adsr_envelope_numpy(
     env = np.zeros(time_length, dtype=np.float32)
     total_t = time_length / sr
 
+    # Attack → Decay → Sustain の区間
     a_end = attack
     d_end = attack + decay
+    # Release は末尾から release 秒前に開始 (sustain 区間の後)
     r_start = max(d_end, total_t - release)
 
     for i, ti in enumerate(t):
         if ti < a_end:
-            # Attack: 0 → 1
             env[i] = ti / (a_end + 1e-6)
         elif ti < d_end:
-            # Decay: 1 → sustain
             env[i] = 1.0 - (1.0 - sustain) * (ti - a_end) / (decay + 1e-6)
         elif ti < r_start:
-            # Sustain
             env[i] = sustain
         else:
-            # Release: sustain → 0
             env[i] = sustain * max(0.0, 1.0 - (ti - r_start) / (release + 1e-6))
 
     return np.clip(env, 0.0, 1.0)
@@ -320,6 +285,8 @@ def adsr_envelope_numpy_fast(
 
     a_end = float(attack)
     d_end = float(attack + decay)
+    # Release は末尾から release 秒前に開始
+    # sustain区間 (d_end〜r_start) が必ず存在するよう保証する
     r_start = float(max(d_end, total_t - release))
 
     env = np.where(
@@ -330,7 +297,7 @@ def adsr_envelope_numpy_fast(
             1.0 - (1.0 - sustain) * (t - a_end) / (decay + 1e-6),
             np.where(
                 t < r_start,
-                sustain,
+                np.full_like(t, sustain),
                 sustain
                 * np.clip(1.0 - (t - r_start) / (release + 1e-6), 0.0, 1.0),
             ),
@@ -587,16 +554,17 @@ if HAS_TF:
             Args: 各パラメータ [batch]  0〜1 の正規化値
             Returns: envelope [batch, time_length]
             """
-            # 秒数に変換 (指数スケール)
+            # 秒数に変換 (対数スケール: value=0→min_sec, value=1→max_sec)
+            min_sec = 0.005
             max_sec = self.total_t * 0.5
 
             def to_sec(v):
-                return tf.exp(tf.math.log(0.001 + max_sec) * v) - 0.001 + 0.001
+                return min_sec * tf.pow(max_sec / min_sec, v)
 
             a = to_sec(attack)  # [batch]
             d = to_sec(decay)
             r = to_sec(release)
-            s = sustain  # レベルなのでそのまま
+            s = sustain
 
             t = tf.cast(
                 tf.linspace(0.0, self.total_t, self.time_length), tf.float32
