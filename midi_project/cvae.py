@@ -26,6 +26,7 @@ cvae.py  ―  Conditional VAE (再設計版)
   テンプレート損失は廃止し、音源から直接学習する。
 """
 
+import numpy as np
 import tensorflow as tf
 from loss import Loss
 
@@ -45,6 +46,7 @@ from dsp import (
     OscillatorLayer,
     ADSRLayer,
     FilterLayer,
+    upsample_frames,
 )
 
 
@@ -237,7 +239,16 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         )
 
         # 各パラメータへの独立ヘッド (すべて同じ 128次元の特徴量から生成)
-        self.harm_head = tf.keras.layers.Dense(num_harmonics, name="harm_head")
+        # harm_head のバイアス初期値: 基音(1倍音)が強く高次が弱い自然な初期分布
+        # sigmoid(-k*(n-1)) で n=1→1.0, n=32→小さい値 になるよう設定
+        harm_bias_init = np.array(
+            [2.0 - i * 0.18 for i in range(num_harmonics)], dtype=np.float32
+        )  # sigmoid 適用後: 1倍音≈0.88, 8倍音≈0.5, 32倍音≈0.07
+        self.harm_head = tf.keras.layers.Dense(
+            num_harmonics,
+            bias_initializer=tf.keras.initializers.Constant(harm_bias_init),
+            name="harm_head",
+        )
         self.attack_head = tf.keras.layers.Dense(
             1, activation="sigmoid", name="attack_head"
         )
