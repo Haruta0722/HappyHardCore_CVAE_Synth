@@ -794,7 +794,8 @@ class SynthApp:
         root.bind("<Right>", lambda e: self._key_shift(+1))
         root.bind("<Down>", lambda e: self._key_shift(-12))
         root.bind("<Up>", lambda e: self._key_shift(+12))
-        root.bind("<space>", lambda e: self._generate())
+        root.bind("i", lambda e: self._infer())
+        root.bind("I", lambda e: self._infer())
 
     def _build_knobs(self, parent):
         frame = tk.Frame(parent, bg=PANEL, pady=12)
@@ -820,23 +821,25 @@ class SynthApp:
 
         btn_frame = tk.Frame(parent, bg=PANEL)
         btn_frame.pack(fill="x", padx=12, pady=4)
-        self._gen_btn = tk.Button(
+
+        # ── 推論ボタン (VAE → DDSPParams を更新、音は出さない) ──
+        self._infer_btn = tk.Button(
             btn_frame,
-            text="GENERATE  [SPACE]",
+            text="INFER PARAMS  [I]",
             bg=PANEL,
-            fg=ACCENT,
+            fg=PITCH_COL,
             activebackground="#222",
-            activeforeground=ACCENT,
+            activeforeground=PITCH_COL,
             relief="flat",
-            font=("Courier", 11, "bold"),
+            font=("Courier", 10, "bold"),
             cursor="hand2",
             bd=0,
-            pady=8,
-            command=self._generate,
-            highlightbackground=ACCENT,
+            pady=7,
+            command=self._infer,
+            highlightbackground=PITCH_COL,
             highlightthickness=1,
         )
-        self._gen_btn.pack(fill="x")
+        self._infer_btn.pack(fill="x")
 
     def _build_waveform(self, parent):
         frame = tk.Frame(parent, bg=PANEL, pady=6)
@@ -857,7 +860,7 @@ class SynthApp:
         kb_frame.pack(fill="x")
         tk.Label(
             kb_frame,
-            text="PITCH SELECT — クリックで即時生成・再生",
+            text="PITCH SELECT — クリックで現在のパラメータで合成・再生",
             bg="#111",
             fg=DIM,
             font=("Courier", 8),
@@ -883,9 +886,7 @@ class SynthApp:
         self._freq_label.pack(anchor="w")
         kb_scroll = tk.Frame(kb_frame, bg="#111")
         kb_scroll.pack(fill="x", padx=16, pady=(8, 0))
-        self._keyboard = PianoKeyboard(
-            kb_scroll, on_note=self._on_note_and_generate
-        )
+        self._keyboard = PianoKeyboard(kb_scroll, on_note=self._on_note)
         self._keyboard.pack(side="left")
 
     def _build_ddsp_panel(self, parent):
@@ -1016,25 +1017,6 @@ class SynthApp:
                 ),
             )
 
-        # RE-SYNTH ボタン
-        tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=8, pady=6)
-        tk.Button(
-            frame,
-            text="RE-SYNTH (手動パラメータで再合成)",
-            bg=PANEL3,
-            fg=ACID_COL,
-            activebackground="#222",
-            activeforeground=ACID_COL,
-            relief="flat",
-            font=("Courier", 8, "bold"),
-            cursor="hand2",
-            bd=0,
-            pady=6,
-            command=self._resynth,
-            highlightbackground=ACID_COL,
-            highlightthickness=1,
-        ).pack(fill="x", padx=8)
-
         # ── ブレンドバー ────────────────────────────────────────────
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=8, pady=6)
         tk.Label(
@@ -1116,14 +1098,15 @@ class SynthApp:
         scale = SLIDER_SCALE.get(key, 1.0)
         setattr(self._ddsp, key, float(value) * scale)
 
-    def _on_note_and_generate(self, midi):
+    def _on_note(self, midi):
+        """鍵盤クリック: ピッチを更新してRE-SYNTH（現在のパラメータで合成・再生）"""
         self._midi = midi
         self._pitch_label.config(text=midi_to_note_name(midi))
         self._freq_label.config(
             text=f"{midi_to_freq(midi):.1f} Hz  |  MIDI {midi}  |  pitch_n = {pitch_norm(midi):.3f}"
         )
         self._update_blend_bars()
-        self._generate()
+        self._resynth()
 
     def _key_shift(self, delta):
         new = max(MIDI_MIN, min(MIDI_MAX, self._midi + delta))
@@ -1181,23 +1164,23 @@ class SynthApp:
             text=f"{s}\n{a}", fg=ACCENT if self.model else DIM
         )
 
-    # ── 生成 ──────────────────────────────────────────────────────────
-    def _generate(self):
+    # ── 推論 (VAE → DDSPParams 更新のみ、音は出さない) ──────────────
+    def _infer(self):
+        """INFERボタン / Iキー: ノブの状態でVAEを実行してパラメータを更新"""
         if self._generating:
             return
         self._generating = True
-        self._gen_btn.config(state="disabled", text="GENERATING...")
-        self._led_on(self._led_gen, ACCENT2)
-        threading.Thread(target=self._generate_thread, daemon=True).start()
+        self._infer_btn.config(state="disabled", text="INFERRING...")
+        self._led_on(self._led_gen, PITCH_COL)
+        threading.Thread(target=self._infer_thread, daemon=True).start()
 
-    def _generate_thread(self):
+    def _infer_thread(self):
         try:
             if self.model is not None:
-                waveform, ddsp = self._run_model()
-                self.root.after(0, lambda: self._post_generate(waveform, ddsp))
+                ddsp = self._run_infer()
             else:
-                waveform = self._demo_waveform()
-                self.root.after(0, lambda: self._post_generate(waveform, None))
+                ddsp = None
+            self.root.after(0, lambda: self._post_infer(ddsp))
         except Exception as e:
             import traceback
 
@@ -1205,48 +1188,78 @@ class SynthApp:
             self.root.after(
                 0,
                 lambda: self._status_label.config(
-                    text=f"ERROR:\n{e}", fg=ACCENT2
+                    text=f"INFER ERROR:\n{e}", fg=ACCENT2
+                ),
+            )
+            self.root.after(0, self._reset_infer_btn)
+
+    def _run_infer(self):
+        """VAEでDDSPParamsを推論して返す (音声合成はしない)"""
+        pn = np.float32(pitch_norm(self._midi))
+        pitch_t = tf.constant([pn], dtype=tf.float32)
+        timbre_w = weights_to_tensor(self._params)
+        return self.model.infer_ddsp_params(pitch_t, timbre_weights=timbre_w)
+
+    def _post_infer(self, ddsp):
+        if ddsp is not None:
+            self._ddsp = ddsp
+            self._update_ddsp_sliders(ddsp)
+            self._status_label.config(
+                text="INFER 完了\n鍵盤またはSYNTHで合成", fg=PITCH_COL
+            )
+        else:
+            self._status_label.config(text="デモモード\nモデル未ロード", fg=DIM)
+        self._reset_infer_btn()
+
+    def _reset_infer_btn(self):
+        self._generating = False
+        self._infer_btn.config(state="normal", text="INFER PARAMS  [I]")
+        self.root.after(800, lambda: self._led_off(self._led_gen))
+
+    # ── 合成 (現在の _ddsp で音声合成・再生) ─────────────────────────
+    def _synth(self):
+        """鍵盤 / SPACEキー / SYNTHボタン: 現在の_ddspパラメータで合成・再生"""
+        if self._generating:
+            return
+        # モデル未ロード時はデモ波形を直接再生
+        if self.model is None and self._ddsp is None:
+            waveform = self._demo_waveform()
+            self._wave_view.set_data(waveform)
+            if HAS_SD:
+                sd.stop()
+                sd.play(waveform, SR)
+            self._status_label.config(text="DEMO SYNTH 完了", fg=DIM)
+            return
+        if self._ddsp is None:
+            self._status_label.config(text="先にINFERしてください", fg=ACCENT2)
+            return
+        self._generating = True
+        self._led_on(self._led_play, ACCENT3)
+        threading.Thread(target=self._synth_thread, daemon=True).start()
+
+    def _synth_thread(self):
+        try:
+            waveform = self._run_synth()
+            self.root.after(0, lambda: self._post_synth(waveform))
+        except Exception as e:
+            import traceback
+
+            traceback.print_exc()
+            self.root.after(
+                0,
+                lambda: self._status_label.config(
+                    text=f"SYNTH ERROR:\n{e}", fg=ACCENT2
                 ),
             )
             self.root.after(0, self._reset_gen_btn)
 
-    def _run_model(self):
-        """
-        VAEで DDSPParams を推論 → dsp.synthesize_numpy() で音声合成。
-        推論したパラメータをスライダーに反映し、GUIで上書き可能にする。
-        """
-        pn = np.float32(pitch_norm(self._midi))
-        pitch_t = tf.constant([pn], dtype=tf.float32)
-        timbre_w = weights_to_tensor(self._params)
-
-        # VAEでパラメータ推論
-        ddsp = self.model.infer_ddsp_params(pitch_t, timbre_weights=timbre_w)
-        self._ddsp = ddsp
-
-        # NumPy DSPで合成 (TF不要・マイコンと同じパス)
-        waveform = synthesize_numpy(
-            ddsp, sr=SR, time_length=TIME_LENGTH, fast_filter=True
-        )
-        waveform = np.nan_to_num(waveform)
-        peak = np.max(np.abs(waveform))
-        if peak > 1e-6:
-            waveform = waveform / peak * 0.95
-
-        if HAS_SF:
-            sf.write("generated.wav", waveform, SR)
-        return waveform.astype(np.float32), ddsp
-
-    def _resynth(self):
-        """スライダーと倍音エディタで設定したパラメータで再合成"""
-        if self._ddsp is None:
-            self._status_label.config(
-                text="先にGENERATEしてください", fg=ACCENT2
-            )
-            return
-        # 各ウィジェットの最新値を反映
+    def _run_synth(self):
+        """現在の _ddsp を使って音声を合成する (VAEは呼ばない)"""
+        # 最新のウィジェット値を _ddsp に反映
         self._ddsp.harmonic_amps = self._harm_editor.get_amps()
         self._ddsp.unison_voices = self._voice_stepper.get()
         self._ddsp.f0_hz = float(midi_to_freq(self._midi))
+
         waveform = synthesize_numpy(
             self._ddsp, sr=SR, time_length=TIME_LENGTH, fast_filter=True
         )
@@ -1255,14 +1268,29 @@ class SynthApp:
         if peak > 1e-6:
             waveform = waveform / peak * 0.95
         if HAS_SF:
-            sf.write("resynth.wav", waveform.astype(np.float32), SR)
+            sf.write("generated.wav", waveform.astype(np.float32), SR)
+        return waveform.astype(np.float32)
+
+    def _post_synth(self, waveform):
         self._wave_view.set_data(waveform)
         if HAS_SD:
             sd.stop()
-            sd.play(waveform.astype(np.float32), SR)
-        self._status_label.config(text="RE-SYNTH 完了", fg=ACID_COL)
+            sd.play(waveform, SR)
+        self._status_label.config(
+            text=f"SYNTH 完了\n{len(waveform)/SR:.2f}s  {SR}Hz", fg=ACCENT
+        )
+        self._reset_gen_btn()
+
+    def _reset_gen_btn(self):
+        self._generating = False
+        self.root.after(2000, lambda: self._led_off(self._led_play))
+
+    def _resynth(self):
+        """RE-SYNTHボタン: スライダー手動編集後に再合成"""
+        self._synth()
 
     def _demo_waveform(self):
+        """デモ波形 (モデル未ロード時に _ddsp 初期値として使用)"""
         midi = self._midi
         raw = np.array(
             [self._params[n] for n in TIMBRE_NAMES], dtype=np.float32
@@ -1284,25 +1312,6 @@ class SynthApp:
         if peak > 1e-6:
             s = s / peak * 0.90
         return s.astype(np.float32)
-
-    def _post_generate(self, waveform, ddsp):
-        self._wave_view.set_data(waveform)
-        if ddsp is not None:
-            self._update_ddsp_sliders(ddsp)
-        if HAS_SD:
-            self._led_on(self._led_play, ACCENT3)
-            sd.stop()
-            sd.play(waveform, SR)
-        self._status_label.config(
-            text=f"GENERATED\n{len(waveform)/SR:.2f}s  {SR}Hz", fg=ACCENT
-        )
-        self._reset_gen_btn()
-
-    def _reset_gen_btn(self):
-        self._generating = False
-        self._gen_btn.config(state="normal", text="GENERATE  [SPACE]")
-        self.root.after(800, lambda: self._led_off(self._led_gen))
-        self.root.after(2000, lambda: self._led_off(self._led_play))
 
     def _led_on(self, item, color):
         self._led_canvas.itemconfig(item, fill=color)
