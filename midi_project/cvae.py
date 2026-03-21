@@ -47,6 +47,9 @@ from dsp import (
     ADSRLayer,
     FilterLayer,
     upsample_frames,
+    envelope_regularization_losses,
+    NUM_ENVELOPES,
+    NUM_TARGETS,
 )
 
 
@@ -272,7 +275,6 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         )
 
         # Unison ヘッド
-        # unison_voices_raw: 0〜1 → 呼び出し側で 1〜7 の整数に変換
         self.unison_voices_head = tf.keras.layers.Dense(
             1, activation="sigmoid", name="unison_voices_head"
         )
@@ -282,6 +284,58 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         self.unison_blend_head = tf.keras.layers.Dense(
             1, activation="sigmoid", name="unison_blend_head"
         )
+
+        # ベース値ヘッド (エンベロープがない状態の固定値)
+        self.cutoff_base_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="cutoff_base"
+        )
+        self.resonance_base_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="res_base"
+        )
+        self.detune_base_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="detune_base"
+        )
+        self.blend_base_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="blend_base"
+        )
+        self.brightness_base_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="bright_base"
+        )
+        self.noise_base_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="noise_base"
+        )
+
+        # マルチエンベロープ: 各エンベロープのADSR [NUM_ENVELOPES × 4ヘッド]
+        self.env_attack_heads = [
+            tf.keras.layers.Dense(1, activation="sigmoid", name=f"env_a_{i}")
+            for i in range(NUM_ENVELOPES)
+        ]
+        self.env_decay_heads = [
+            tf.keras.layers.Dense(1, activation="sigmoid", name=f"env_d_{i}")
+            for i in range(NUM_ENVELOPES)
+        ]
+        self.env_sustain_heads = [
+            tf.keras.layers.Dense(1, activation="sigmoid", name=f"env_s_{i}")
+            for i in range(NUM_ENVELOPES)
+        ]
+        self.env_release_heads = [
+            tf.keras.layers.Dense(1, activation="sigmoid", name=f"env_r_{i}")
+            for i in range(NUM_ENVELOPES)
+        ]
+
+        # ゲート行列: [NUM_ENVELOPES × NUM_TARGETS ヘッド]
+        # 初期値を小さく (0.1付近) してスパース化を促進
+        self.gate_heads = [
+            tf.keras.layers.Dense(
+                NUM_TARGETS,
+                activation="sigmoid",
+                bias_initializer=tf.keras.initializers.Constant(
+                    -2.0
+                ),  # sigmoid(-2) ≈ 0.12
+                name=f"gate_{i}",
+            )
+            for i in range(NUM_ENVELOPES)
+        ]
 
     def call(self, z, cond):
         """
@@ -305,14 +359,33 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         decay = tf.squeeze(self.decay_head(feat), -1)
         sustain = tf.squeeze(self.sustain_head(feat), -1)
         release = tf.squeeze(self.release_head(feat), -1)
-        cutoff = tf.squeeze(self.cutoff_head(feat), -1)
-        resonance = tf.squeeze(self.resonance_head(feat), -1)
-        noise_amount = tf.squeeze(self.noise_head(feat), -1)
-
-        # Unison (0〜1 の連続値として出力)
         unison_voices_raw = tf.squeeze(self.unison_voices_head(feat), -1)
         detune_cents_raw = tf.squeeze(self.detune_cents_head(feat), -1)
         unison_blend = tf.squeeze(self.unison_blend_head(feat), -1)
+
+        # ベース値
+        cutoff_base = tf.squeeze(self.cutoff_base_head(feat), -1)
+        resonance_base = tf.squeeze(self.resonance_base_head(feat), -1)
+        detune_base = tf.squeeze(self.detune_base_head(feat), -1)
+        blend_base = tf.squeeze(self.blend_base_head(feat), -1)
+        brightness_base = tf.squeeze(self.brightness_base_head(feat), -1)
+        noise_base = tf.squeeze(self.noise_base_head(feat), -1)
+
+        # マルチエンベロープ ADSR [batch, NUM_ENVELOPES, 4]
+        env_adsr_list = []
+        for i in range(NUM_ENVELOPES):
+            a = self.env_attack_heads[i](feat)  # [batch, 1]
+            d = self.env_decay_heads[i](feat)
+            s = self.env_sustain_heads[i](feat)
+            r = self.env_release_heads[i](feat)
+            env_adsr_list.append(tf.concat([a, d, s, r], axis=-1))  # [batch, 4]
+        env_adsr = tf.stack(env_adsr_list, axis=1)  # [batch, NUM_ENVELOPES, 4]
+
+        # ゲート行列 [batch, NUM_ENVELOPES, NUM_TARGETS]
+        gate_list = [self.gate_heads[i](feat) for i in range(NUM_ENVELOPES)]
+        env_gates = tf.stack(
+            gate_list, axis=1
+        )  # [batch, NUM_ENVELOPES, NUM_TARGETS]
 
         return {
             "harmonic_amps": harmonic_amps,
@@ -320,12 +393,17 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
             "decay": decay,
             "sustain": sustain,
             "release": release,
-            "cutoff": cutoff,
-            "resonance": resonance,
-            "noise_amount": noise_amount,
-            "unison_voices_raw": unison_voices_raw,  # 0〜1 → 呼び出し側で1〜7に変換
-            "detune_cents_raw": detune_cents_raw,  # 0〜1 → 呼び出し側で0〜100centに変換
+            "unison_voices_raw": unison_voices_raw,
+            "detune_cents_raw": detune_cents_raw,
             "unison_blend": unison_blend,
+            "cutoff_base": cutoff_base,
+            "resonance_base": resonance_base,
+            "detune_base": detune_base,
+            "blend_base": blend_base,
+            "brightness_base": brightness_base,
+            "noise_base": noise_base,
+            "env_adsr": env_adsr,  # [batch, NUM_ENVELOPES, 4]
+            "env_gates": env_gates,  # [batch, NUM_ENVELOPES, NUM_TARGETS]
         }
 
 
@@ -378,13 +456,15 @@ class TimeWiseCVAE(tf.keras.Model):
         return 440.0 * tf.pow(2.0, (midi - 69.0) / 12.0)
 
     def _synthesize_from_params(self, p, f0_hz, training=False):
-        audio = self.oscillator(f0_hz, p["harmonic_amps"])
+        """Decoderパラメータ辞書 → 音声波形 (TFレイヤー版)"""
+        audio = self.oscillator(f0_hz, p["harmonic_amps"], p["brightness_base"])
         env = self.adsr(p["attack"], p["decay"], p["sustain"], p["release"])
         audio = audio * env
-        audio = self.filter_l(audio, p["cutoff"], p["resonance"])
+        # フィルタはベース値を使用 (エンベロープルーティングはNumPy合成側で行う)
+        audio = self.filter_l(audio, p["cutoff_base"], p["resonance_base"])
         batch_size = tf.shape(audio)[0]
         noise = tf.random.normal([batch_size, TIME_LENGTH]) * tf.reshape(
-            p["noise_amount"], [-1, 1]
+            p["noise_base"], [-1, 1]
         )
         audio = audio + noise
         return tf.keras.activations.tanh(audio)
@@ -477,16 +557,17 @@ class TimeWiseCVAE(tf.keras.Model):
             decay=float(p["decay"][0]),
             sustain=float(p["sustain"][0]),
             release=float(p["release"][0]),
-            cutoff=float(p["cutoff"][0]),
-            resonance=float(p["resonance"][0]),
-            noise_amount=float(p["noise_amount"][0]),
-            # Unison: 0〜1 の連続値を実際の範囲に変換
-            unison_voices=int(
-                round(float(p["unison_voices_raw"][0]) * 6 + 1)
-            ),  # 0〜1 → 1〜7
-            detune_cents=float(p["detune_cents_raw"][0])
-            * 100.0,  # 0〜1 → 0〜100cent
-            unison_blend=float(p["unison_blend"][0]),
+            unison_voices=int(round(float(p["unison_voices_raw"][0]) * 6 + 1)),
+            detune_base=float(p["detune_base"][0]),
+            blend_base=float(p["blend_base"][0]),
+            cutoff_base=float(p["cutoff_base"][0]),
+            resonance_base=float(p["resonance_base"][0]),
+            noise_base=float(p["noise_base"][0]),
+            brightness_base=float(p["brightness_base"][0]),
+            env_adsr=p["env_adsr"][0].numpy().tolist(),  # [NUM_ENVELOPES, 4]
+            env_gates=p["env_gates"][0]
+            .numpy()
+            .tolist(),  # [NUM_ENVELOPES, NUM_TARGETS]
         )
 
     # ----------------------------------------------------------
@@ -541,6 +622,16 @@ class TimeWiseCVAE(tf.keras.Model):
         hf_l = s(compute_high_freq_emphasis_loss(x_target, x_hat_sq))
         flux_l = s(compute_spectral_flux_loss(x_target, x_hat_sq), 0.1)
 
+        # エンベロープ正則化損失
+        env_losses = envelope_regularization_losses(
+            p["env_adsr"],
+            p["env_gates"],
+            lambda_sparse=0.01,
+            lambda_entropy=0.01,
+            lambda_diverse=0.005,
+        )
+        env_reg = s(env_losses["env_total"], 0.0)
+
         kl_per_dim = -0.5 * (
             1.0 + z_logvar - tf.square(z_mean) - tf.exp(z_logvar)
         )
@@ -559,11 +650,23 @@ class TimeWiseCVAE(tf.keras.Model):
             + mel_l * 4.0
             + hf_l * 2.0
             + flux_l * 2.0
+            + env_reg * 1.0  # エンベロープ正則化
             + kl * kl_w
         )
         loss = s(loss, 1000.0)
 
-        return loss, recon, stft_l, mel_l, hf_l, flux_l, kl, kl_w, z_mean
+        return (
+            loss,
+            recon,
+            stft_l,
+            mel_l,
+            hf_l,
+            flux_l,
+            env_reg,
+            kl,
+            kl_w,
+            z_mean,
+        )
 
     # ----------------------------------------------------------
     # train_step
@@ -572,9 +675,18 @@ class TimeWiseCVAE(tf.keras.Model):
         (audio, pitch, timbre_id), _ = data
 
         with tf.GradientTape() as tape:
-            loss, recon, stft_l, mel_l, hf_l, flux_l, kl, kl_w, z_mean = (
-                self._compute_losses(audio, pitch, timbre_id, training=True)
-            )
+            (
+                loss,
+                recon,
+                stft_l,
+                mel_l,
+                hf_l,
+                flux_l,
+                env_reg,
+                kl,
+                kl_w,
+                z_mean,
+            ) = self._compute_losses(audio, pitch, timbre_id, training=True)
 
         grads = tape.gradient(loss, self.trainable_variables)
         grads = [
@@ -611,6 +723,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "high_freq": hf_l,
             "spectral_flux": flux_l,
+            "env_reg": env_reg,
             "kl": kl,
             "kl_weight": kl_w,
             "z_std_ema": self.z_std_ema,
@@ -622,7 +735,7 @@ class TimeWiseCVAE(tf.keras.Model):
     # ----------------------------------------------------------
     def test_step(self, data):
         (audio, pitch, timbre_id), _ = data
-        loss, recon, stft_l, mel_l, hf_l, flux_l, kl, kl_w, _ = (
+        loss, recon, stft_l, mel_l, hf_l, flux_l, env_reg, kl, kl_w, _ = (
             self._compute_losses(audio, pitch, timbre_id, training=False)
         )
         return {
@@ -632,6 +745,7 @@ class TimeWiseCVAE(tf.keras.Model):
             "mel": mel_l,
             "high_freq": hf_l,
             "spectral_flux": flux_l,
+            "env_reg": env_reg,
             "kl": kl,
             "kl_weight": kl_w,
         }
