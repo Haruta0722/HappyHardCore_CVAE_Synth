@@ -271,6 +271,18 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
             1, activation="sigmoid", name="noise_head"
         )
 
+        # Unison ヘッド
+        # unison_voices_raw: 0〜1 → 呼び出し側で 1〜7 の整数に変換
+        self.unison_voices_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="unison_voices_head"
+        )
+        self.detune_cents_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="detune_cents_head"
+        )
+        self.unison_blend_head = tf.keras.layers.Dense(
+            1, activation="sigmoid", name="unison_blend_head"
+        )
+
     def call(self, z, cond):
         """
         z    : [batch, LATENT_STEPS, latent_dim]
@@ -297,6 +309,11 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
         resonance = tf.squeeze(self.resonance_head(feat), -1)
         noise_amount = tf.squeeze(self.noise_head(feat), -1)
 
+        # Unison (0〜1 の連続値として出力)
+        unison_voices_raw = tf.squeeze(self.unison_voices_head(feat), -1)
+        detune_cents_raw = tf.squeeze(self.detune_cents_head(feat), -1)
+        unison_blend = tf.squeeze(self.unison_blend_head(feat), -1)
+
         return {
             "harmonic_amps": harmonic_amps,
             "attack": attack,
@@ -306,6 +323,9 @@ class DDSPParameterDecoder(tf.keras.layers.Layer):
             "cutoff": cutoff,
             "resonance": resonance,
             "noise_amount": noise_amount,
+            "unison_voices_raw": unison_voices_raw,  # 0〜1 → 呼び出し側で1〜7に変換
+            "detune_cents_raw": detune_cents_raw,  # 0〜1 → 呼び出し側で0〜100centに変換
+            "unison_blend": unison_blend,
         }
 
 
@@ -460,6 +480,13 @@ class TimeWiseCVAE(tf.keras.Model):
             cutoff=float(p["cutoff"][0]),
             resonance=float(p["resonance"][0]),
             noise_amount=float(p["noise_amount"][0]),
+            # Unison: 0〜1 の連続値を実際の範囲に変換
+            unison_voices=int(
+                round(float(p["unison_voices_raw"][0]) * 6 + 1)
+            ),  # 0〜1 → 1〜7
+            detune_cents=float(p["detune_cents_raw"][0])
+            * 100.0,  # 0〜1 → 0〜100cent
+            unison_blend=float(p["unison_blend"][0]),
         )
 
     # ----------------------------------------------------------
