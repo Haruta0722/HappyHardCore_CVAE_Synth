@@ -148,7 +148,7 @@ class EnvelopeEditor(tk.Frame):
       └─ ROUTING ゲートスライダー × NUM_TARGETS
     """
 
-    PREVIEW_W = 340
+    PREVIEW_W = 300
     PREVIEW_H = 70
 
     def __init__(self, parent, on_change=None, **kw):
@@ -1084,7 +1084,7 @@ class SynthApp:
         main.pack(fill="both", expand=True)
         left = tk.Frame(main, bg=PANEL)
         left.pack(side="left", fill="both", expand=True, padx=(0, 1))
-        right = tk.Frame(main, bg=PANEL2, width=260)
+        right = tk.Frame(main, bg=PANEL2, width=380)
         right.pack(side="right", fill="y")
         right.pack_propagate(False)
 
@@ -1517,10 +1517,11 @@ class SynthApp:
             import traceback
 
             traceback.print_exc()
+            err = e
             self.root.after(
                 0,
-                lambda: self._status_label.config(
-                    text=f"INFER ERROR:\n{e}", fg=ACCENT2
+                lambda msg=err: self._status_label.config(
+                    text=f"INFER ERROR:\n{msg}", fg=ACCENT2
                 ),
             )
             self.root.after(0, self._reset_infer_btn)
@@ -1577,10 +1578,11 @@ class SynthApp:
             import traceback
 
             traceback.print_exc()
+            err = e
             self.root.after(
                 0,
-                lambda: self._status_label.config(
-                    text=f"SYNTH ERROR:\n{e}", fg=ACCENT2
+                lambda msg=err: self._status_label.config(
+                    text=f"SYNTH ERROR:\n{msg}", fg=ACCENT2
                 ),
             )
             self.root.after(0, self._reset_gen_btn)
