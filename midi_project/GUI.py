@@ -37,7 +37,13 @@ except ImportError:
 try:
     import tensorflow as tf
     from cvae import TimeWiseCVAE
-    from dsp import DDSPParams, synthesize_numpy
+    from dsp import (
+        DDSPParams,
+        synthesize_numpy,
+        NUM_ENVELOPES,
+        NUM_TARGETS,
+        TARGET_NAMES,
+    )
     from config import (
         TIME_LENGTH,
         TIMBRE_VOCAB,
@@ -51,9 +57,18 @@ except Exception as e:
     TIME_LENGTH = 62400
     TIMBRE_VOCAB = 3
     NUM_HARMONICS = 32
+    NUM_ENVELOPES = 4
+    NUM_TARGETS = 6
+    TARGET_NAMES = [
+        "cutoff",
+        "resonance",
+        "detune_cents",
+        "unison_blend",
+        "harmonic_bright",
+        "noise_amount",
+    ]
     print(f"[警告] モデル読み込みスキップ: {e}")
 
-    # ダミークラス
     class DDSPParams:
         def __init__(self, **kw):
             pass
@@ -86,28 +101,318 @@ KEY_ACT = ACCENT
 KNOB_COLORS = {"screech": ACCENT2, "acid": ACID_COL, "pluck": ACCENT3}
 TIMBRE_NAMES = ["screech", "acid", "pluck"]
 
-# DDSPパラメータスライダーの定義 (Oscillator は HarmonicEditor で別途表示)
-# (キー, 表示ラベル, 色, グループ)
+# DDSPパラメータスライダー (Oscillator=HarmonicEditor, Envelope=EnvelopeEditor で別途表示)
 DDSP_SLIDERS = [
-    # Unison (unison_voices は専用ステッパーで別途表示)
-    ("detune_cents", "DETUNE", ACCENT, "UNI"),  # 0〜100 cent
-    ("unison_blend", "BLEND", ACCENT, "UNI"),  # ドライ/ウェット
-    # ADSR
+    # Unison
+    ("detune_base", "DETUNE", ACCENT, "UNI"),
+    ("blend_base", "BLEND", ACCENT, "UNI"),
+    # 音量ADSR
     ("attack", "ATTACK", ACCENT3, "ENV"),
     ("decay", "DECAY", ACCENT3, "ENV"),
     ("sustain", "SUSTAIN", ACCENT3, "ENV"),
     ("release", "RELEASE", ACCENT3, "ENV"),
-    # Filter
-    ("cutoff", "CUTOFF", ACID_COL, "FLT"),
-    ("resonance", "RESONANCE", ACID_COL, "FLT"),
-    # Noise
-    ("noise_amount", "NOISE", ACCENT2, "NOI"),
+    # Filter ベース値
+    ("cutoff_base", "CUTOFF", ACID_COL, "FLT"),
+    ("resonance_base", "RESONANCE", ACID_COL, "FLT"),
+    # Noise ベース値
+    ("noise_base", "NOISE", ACCENT2, "NOI"),
+    # Brightness ベース値
+    ("brightness_base", "BRIGHTNESS", ACCENT, "OSC"),
 ]
 
-# detune_cents は 0〜100 の実値スケール (スライダーの 0〜1 → 0〜100 に変換)
-SLIDER_SCALE = {
-    "detune_cents": 100.0,  # スライダー値 × 100 = cents
-}
+SLIDER_SCALE = {}  # スケール変換が必要なパラメータ (現在なし)
+
+# エンベロープ番号ごとの色
+ENV_COLORS = ["#ff6644", "#44ddff", "#aaff44", "#ff44aa"]
+# ターゲットの表示ラベル
+TARGET_LABELS = [
+    "CUTOFF",
+    "RESONANCE",
+    "DETUNE",
+    "UNI BLEND",
+    "BRIGHTNESS",
+    "NOISE",
+]
+
+
+# ══════════════════════════════════════════════════════════════
+#  EnvelopeEditor  4本のマルチエンベロープ操作ウィジェット
+# ══════════════════════════════════════════════════════════════
+class EnvelopeEditor(tk.Frame):
+    """
+    4本のADSRエンベロープとゲート行列をタブ切り替えで操作するウィジェット。
+
+    各タブ:
+      ├─ エンベロープ波形プレビュー (Canvas)
+      ├─ ADSR ノブ × 4
+      └─ ROUTING ゲートスライダー × NUM_TARGETS
+    """
+
+    PREVIEW_W = 340
+    PREVIEW_H = 70
+
+    def __init__(self, parent, on_change=None, **kw):
+        super().__init__(parent, bg=PANEL3, **kw)
+        self.on_change = on_change
+        self._current_env = 0
+
+        self._env_adsr = [[0.1, 0.3, 0.5, 0.3] for _ in range(NUM_ENVELOPES)]
+        self._env_gates = [[0.0] * NUM_TARGETS for _ in range(NUM_ENVELOPES)]
+
+        # ノブ・ゲート変数 (後でbuild時に生成)
+        self._adsr_knobs = []  # [NUM_ENVELOPES][4]
+        self._gate_vars = [
+            [tk.DoubleVar(value=0.0) for _ in range(NUM_TARGETS)]
+            for _ in range(NUM_ENVELOPES)
+        ]
+        self._preview_cvs = []  # [NUM_ENVELOPES] Canvas
+
+        self._build()
+
+    # ── ビルド ───────────────────────────────────────────────────
+    def _build(self):
+        # タブボタン行
+        tab_row = tk.Frame(self, bg=PANEL3)
+        tab_row.pack(fill="x")
+        self._tab_btns = []
+        for i in range(NUM_ENVELOPES):
+            btn = tk.Button(
+                tab_row,
+                text=f"ENV {i+1}",
+                bg=PANEL3,
+                fg=ENV_COLORS[i],
+                relief="flat",
+                font=("Courier", 8, "bold"),
+                cursor="hand2",
+                bd=0,
+                padx=8,
+                pady=4,
+                activebackground="#222",
+                activeforeground=ENV_COLORS[i],
+                command=lambda idx=i: self._select_tab(idx),
+                highlightthickness=0,
+            )
+            btn.pack(side="left", padx=2)
+            self._tab_btns.append(btn)
+
+        tk.Frame(self, bg=BORDER, height=1).pack(fill="x")
+
+        self._tab_frames = []
+        for i in range(NUM_ENVELOPES):
+            f = tk.Frame(self, bg=PANEL3)
+            self._build_env_tab(f, i)
+            self._tab_frames.append(f)
+
+        self._select_tab(0)
+
+    def _build_env_tab(self, parent, env_idx):
+        color = ENV_COLORS[env_idx]
+
+        # ── エンベロープ波形プレビュー ────────────────────────────
+        preview = tk.Canvas(
+            parent,
+            width=self.PREVIEW_W,
+            height=self.PREVIEW_H,
+            bg="#090909",
+            highlightthickness=1,
+            highlightbackground=BORDER,
+        )
+        preview.pack(fill="x", padx=6, pady=(6, 2))
+        self._preview_cvs.append(preview)
+
+        # ── ADSRノブ行 ────────────────────────────────────────────
+        knob_frame = tk.Frame(parent, bg=PANEL3)
+        knob_frame.pack(pady=(4, 2))
+
+        adsr_labels = ["ATTACK", "DECAY", "SUSTAIN", "RELEASE"]
+        knobs_row = []
+        for j, lbl in enumerate(adsr_labels):
+            kb = Knob(
+                knob_frame,
+                label=lbl,
+                color=color,
+                size=60,
+                command=lambda v, ei=env_idx, ji=j: self._on_adsr(ei, ji, v),
+            )
+            kb.set_silent(self._env_adsr[env_idx][j])
+            kb.pack(side="left", padx=6)
+            knobs_row.append(kb)
+        self._adsr_knobs.append(knobs_row)
+
+        # ── ゲートスライダー ──────────────────────────────────────
+        tk.Frame(parent, bg=BORDER, height=1).pack(
+            fill="x", padx=4, pady=(6, 2)
+        )
+        gate_frame = tk.Frame(parent, bg=PANEL3, padx=6, pady=2)
+        gate_frame.pack(fill="x")
+        tk.Label(
+            gate_frame,
+            text="ROUTING  (各ターゲットへのゲート量)",
+            bg=PANEL3,
+            fg=DIM,
+            font=("Courier", 7),
+        ).pack(anchor="w")
+
+        for j, tgt_label in enumerate(TARGET_LABELS):
+            row = tk.Frame(gate_frame, bg=PANEL3)
+            row.pack(fill="x", pady=1)
+            tk.Label(
+                row,
+                text=f"{tgt_label:<12}",
+                bg=PANEL3,
+                fg=color,
+                font=("Courier", 7),
+                width=12,
+                anchor="w",
+            ).pack(side="left")
+            var = self._gate_vars[env_idx][j]
+            sl = tk.Scale(
+                row,
+                variable=var,
+                from_=0.0,
+                to=1.0,
+                resolution=0.01,
+                orient="horizontal",
+                length=140,
+                bg=PANEL3,
+                fg=color,
+                troughcolor="#222",
+                highlightthickness=0,
+                activebackground=color,
+                showvalue=False,
+                command=lambda v, ei=env_idx, ji=j: self._on_gate(
+                    ei, ji, float(v)
+                ),
+            )
+            sl.pack(side="left", padx=2)
+            val_lbl = tk.Label(
+                row,
+                text="0.00",
+                bg=PANEL3,
+                fg=color,
+                font=("Courier", 8),
+                width=4,
+            )
+            val_lbl.pack(side="left")
+            var.trace_add(
+                "write",
+                lambda *a, vl=val_lbl, vr=var: vl.config(
+                    text=f"{vr.get():.2f}"
+                ),
+            )
+
+        # 初期プレビュー描画
+        parent.after(50, lambda: self._redraw_preview(env_idx))
+
+    # ── タブ切り替え ─────────────────────────────────────────────
+    def _select_tab(self, idx):
+        self._current_env = idx
+        for f in self._tab_frames:
+            f.pack_forget()
+        self._tab_frames[idx].pack(fill="x")
+        for i, btn in enumerate(self._tab_btns):
+            btn.config(
+                bg=ENV_COLORS[i] if i == idx else PANEL3,
+                fg=PANEL3 if i == idx else ENV_COLORS[i],
+            )
+        self._redraw_preview(idx)
+
+    # ── プレビュー描画 ───────────────────────────────────────────
+    def _redraw_preview(self, env_idx):
+        """現在のADSR値からエンベロープ波形を描画する"""
+        if env_idx >= len(self._preview_cvs):
+            return
+        cv = self._preview_cvs[env_idx]
+        cv.delete("all")
+        w = cv.winfo_width() or self.PREVIEW_W
+        h = cv.winfo_height() or self.PREVIEW_H
+        color = ENV_COLORS[env_idx]
+
+        a, d, s, r = self._env_adsr[env_idx]
+        total = 1.0  # 正規化時間軸
+
+        # 区間の割り当て (時間軸を0〜1に正規化して描画)
+        # attack終了: a_end, decay終了: d_end, release開始: r_start
+        a_end = a * 0.4  # attack は全体の40%まで
+        d_end = a_end + d * 0.3  # decay は全体の30%まで
+        r_start = 1.0 - r * 0.3  # release は末尾30%から
+        r_start = max(d_end, r_start)
+
+        # x座標変換
+        def tx(t):
+            return int(t * (w - 4) + 2)
+
+        def ty(v):
+            return int((1.0 - v) * (h - 8) + 4)
+
+        # ベースライン
+        cv.create_line(0, ty(0), w, ty(0), fill="#1a1a1a", width=1)
+        cv.create_line(0, ty(s), w, ty(s), fill="#222222", width=1, dash=(2, 4))
+
+        # エンベロープ形状を折れ線で描画
+        pts = [
+            (tx(0.0), ty(0.0)),  # 開始
+            (tx(a_end), ty(1.0)),  # アタックピーク
+            (tx(d_end), ty(s)),  # ディケイ終了 = サステインレベル
+            (tx(r_start), ty(s)),  # サステイン維持
+            (tx(1.0), ty(0.0)),  # リリース終了
+        ]
+        flat_pts = [c for p in pts for c in p]
+        cv.create_line(*flat_pts, fill="#2a2a2a", width=4, smooth=False)
+        cv.create_line(*flat_pts, fill=color, width=2, smooth=False)
+
+        # 各区間の点をハイライト
+        for px, py in pts:
+            cv.create_oval(
+                px - 3, py - 3, px + 3, py + 3, fill=color, outline=""
+            )
+
+        # ラベル
+        cv.create_text(
+            4,
+            4,
+            text="ENVELOPE PREVIEW",
+            fill=DIM,
+            font=("Courier", 6),
+            anchor="nw",
+        )
+
+    # ── コールバック ─────────────────────────────────────────────
+    def _on_adsr(self, env_idx, param_idx, value):
+        self._env_adsr[env_idx][param_idx] = float(value)
+        self._redraw_preview(env_idx)
+        if self.on_change:
+            self.on_change(self._env_adsr, self._env_gates)
+
+    def _on_gate(self, env_idx, target_idx, value):
+        self._env_gates[env_idx][target_idx] = float(value)
+        if self.on_change:
+            self.on_change(self._env_adsr, self._env_gates)
+
+    # ── 外部API ─────────────────────────────────────────────────
+    def get_env_adsr(self):
+        return [list(row) for row in self._env_adsr]
+
+    def get_env_gates(self):
+        return [list(row) for row in self._env_gates]
+
+    def set_env_adsr(self, env_adsr):
+        """推論値をノブに反映してプレビュー更新"""
+        for i in range(min(NUM_ENVELOPES, len(env_adsr))):
+            for j in range(4):
+                v = float(np.clip(env_adsr[i][j], 0.0, 1.0))
+                self._env_adsr[i][j] = v
+                if i < len(self._adsr_knobs) and j < len(self._adsr_knobs[i]):
+                    self._adsr_knobs[i][j].set_silent(v)
+            self._redraw_preview(i)
+
+    def set_env_gates(self, env_gates):
+        """推論値をスライダーに反映"""
+        for i in range(min(NUM_ENVELOPES, len(env_gates))):
+            for j in range(min(NUM_TARGETS, len(env_gates[i]))):
+                v = float(np.clip(env_gates[i][j], 0.0, 1.0))
+                self._env_gates[i][j] = v
+                self._gate_vars[i][j].set(v)
 
 
 # ══════════════════════════════════════════════════════════════
@@ -1016,6 +1321,23 @@ class SynthApp:
                 ),
             )
 
+        # ── マルチエンベロープエディタ ──────────────────────────────
+        tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=8, pady=(8, 0))
+        env_label_row = tk.Frame(frame, bg=PANEL2, padx=8, pady=4)
+        env_label_row.pack(fill="x")
+        tk.Label(
+            env_label_row,
+            text="▶ MULTI ENVELOPE ROUTING",
+            bg=PANEL2,
+            fg=DIM,
+            font=("Courier", 7),
+        ).pack(anchor="w")
+        self._env_editor = EnvelopeEditor(
+            frame,
+            on_change=self._on_envelope_change,
+        )
+        self._env_editor.pack(fill="x", padx=8, pady=(0, 4))
+
         # ── ブレンドバー ────────────────────────────────────────────
         tk.Frame(frame, bg=BORDER, height=1).pack(fill="x", padx=8, pady=6)
         tk.Label(
@@ -1083,6 +1405,13 @@ class SynthApp:
             return
         self._ddsp.harmonic_amps = amps
 
+    def _on_envelope_change(self, env_adsr, env_gates):
+        """EnvelopeEditorの値が変わったとき DDSPParams を更新"""
+        if self._ddsp is None:
+            return
+        self._ddsp.env_adsr = [list(row) for row in env_adsr]
+        self._ddsp.env_gates = [list(row) for row in env_gates]
+
     def _on_voice_change(self, voices: int):
         """VoiceStepperでボイス数が変わったとき DDSPParams を更新"""
         if self._ddsp is None:
@@ -1129,7 +1458,7 @@ class SynthApp:
             self._bar_texts[name].config(text=f"{norm[i]:.2f}")
 
     def _update_ddsp_sliders(self, ddsp):
-        """DDSPParams の値をスライダー・倍音エディタ・VoiceStepperに反映"""
+        """DDSPParams の値をスライダー・各エディタに反映"""
         if not HAS_MODEL:
             return
 
@@ -1139,18 +1468,22 @@ class SynthApp:
         # VoiceStepper
         self._voice_stepper.set(ddsp.unison_voices)
 
-        # スライダー (スケール逆変換してから 0〜1 に正規化)
+        # マルチエンベロープエディタ
+        self._env_editor.set_env_adsr(ddsp.env_adsr)
+        self._env_editor.set_env_gates(ddsp.env_gates)
+
+        # スライダー
         mapping = {
-            "detune_cents": ddsp.detune_cents
-            / SLIDER_SCALE.get("detune_cents", 1.0),
-            "unison_blend": ddsp.unison_blend,
+            "detune_base": getattr(ddsp, "detune_base", 0.0),
+            "blend_base": getattr(ddsp, "blend_base", 0.5),
             "attack": ddsp.attack,
             "decay": ddsp.decay,
             "sustain": ddsp.sustain,
             "release": ddsp.release,
-            "cutoff": ddsp.cutoff,
-            "resonance": ddsp.resonance,
-            "noise_amount": ddsp.noise_amount,
+            "cutoff_base": getattr(ddsp, "cutoff_base", 1.0),
+            "resonance_base": getattr(ddsp, "resonance_base", 0.0),
+            "noise_base": getattr(ddsp, "noise_base", 0.0),
+            "brightness_base": getattr(ddsp, "brightness_base", 0.5),
         }
         for key, val in mapping.items():
             if key in self._slider_vars:
@@ -1254,9 +1587,10 @@ class SynthApp:
 
     def _run_synth(self):
         """現在の _ddsp を使って音声を合成する (VAEは呼ばない)"""
-        # 最新のウィジェット値を _ddsp に反映
         self._ddsp.harmonic_amps = self._harm_editor.get_amps()
         self._ddsp.unison_voices = self._voice_stepper.get()
+        self._ddsp.env_adsr = self._env_editor.get_env_adsr()
+        self._ddsp.env_gates = self._env_editor.get_env_gates()
         self._ddsp.f0_hz = float(midi_to_freq(self._midi))
 
         waveform = synthesize_numpy(
